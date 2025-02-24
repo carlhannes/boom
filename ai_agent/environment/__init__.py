@@ -1,0 +1,1 @@
+"""Environment package containing Git repository interface"""
