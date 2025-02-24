@@ -46,17 +46,15 @@ class SelfLearner:
             embedding_model: Model to use for embeddings, defaults to all-MiniLM-L6-v2
         """
         self.model = model
-        if client is not None:
-            self.client = client
-        else:
-            try:
+        try:
+            if client:
+                self.client = client
+            else:
                 self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-            except Exception as e:
-                # For testing without API key
-                if api_key == "mock-key":
-                    self.client = None
-                else:
-                    raise e
+        except Exception as e:
+            if not client:  # Only raise if no mock client provided
+                raise e
+            self.client = None  # Will use mock client
                     
         # Initialize the embedding model
         try:

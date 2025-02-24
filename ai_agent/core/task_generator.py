@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 class TaskGenerator:
     """Generates coding tasks from documentation and common patterns"""
@@ -30,6 +31,7 @@ class TaskGenerator:
                 "Debug and fix {problem} in {module}"
             ]
         }
+        self.similarity_threshold = 0.8  # Threshold for considering tasks similar
 
     def extract_tasks_from_docs(self, docs_path: Path) -> List[Dict[str, Any]]:
         """Extract potential tasks from project documentation"""
@@ -86,7 +88,7 @@ class TaskGenerator:
         
         # Generate tasks for common framework patterns
         for framework in frameworks:
-            if framework == 'flask':
+            if (framework == 'flask'):
                 tasks.extend([
                     {
                         'type': 'feature',
@@ -147,34 +149,29 @@ class TaskGenerator:
         return tasks
 
     def filter_duplicate_tasks(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove duplicate or very similar tasks"""
-        unique_tasks = []
-        seen_instructions = set()
-        
-        for task in tasks:
-            # Normalize instruction for comparison
-            normalized = re.sub(r'\s+', ' ', task['instruction'].lower().strip())
-            
-            # Check if we've seen a very similar instruction
-            if normalized not in seen_instructions:
-                similar_exists = False
-                for existing in seen_instructions:
-                    if self._calculate_similarity(normalized, existing) > 0.8:
-                        similar_exists = True
-                        break
-                
-                if not similar_exists:
-                    unique_tasks.append(task)
-                    seen_instructions.add(normalized)
-        
-        return unique_tasks
+        """Filter out duplicate or very similar tasks"""
+        if not tasks:
+            return []
 
-    def _calculate_similarity(self, text1: str, text2: str) -> float:
-        """Calculate similarity between two texts (simple implementation)"""
-        words1 = set(text1.split())
-        words2 = set(text2.split())
+        filtered = []
+        for task in tasks:
+            # Check if task is too similar to any already filtered task
+            is_duplicate = False
+            for existing in filtered:
+                # Lower similarity threshold to catch more similar tasks
+                if (self._calculate_similarity(task['instruction'], existing['instruction']) > 0.7 and
+                    task['type'] == existing['type']):
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                filtered.append(task)
+        return filtered
+
+    def _calculate_similarity(self, str1: str, str2: str) -> float:
+        """Calculate semantic similarity between two strings"""
+        # Normalize strings for better comparison
+        str1 = str1.lower().strip()
+        str2 = str2.lower().strip()
         
-        intersection = words1 & words2
-        union = words1 | words2
-        
-        return len(intersection) / len(union) if union else 0.0
+        # Use SequenceMatcher for more accurate similarity
+        return SequenceMatcher(None, str1, str2).ratio()

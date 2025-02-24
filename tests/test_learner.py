@@ -104,6 +104,11 @@ def test_plan_next_action(learner_with_mock):
         }
     ]
     
+    # Configure mock to return valid action
+    learner_with_mock.client.chat.completions.create.return_value = Mock(
+        choices=[Mock(message=Mock(content='{"type": "edit_file", "path": "test.py"}'))]
+    )
+
     action = learner_with_mock.plan_next_action(
         current_state,
         "Add input validation",
@@ -168,6 +173,11 @@ def test_action_type_risk_levels(learner_with_mock, action_type, expected_base_r
 
 def test_get_pattern_suggestions(learner_with_mock):
     """Test extraction of pattern suggestions from examples"""
+    # Configure mock to return pattern suggestions
+    learner_with_mock.client.chat.completions.create.return_value = Mock(
+        choices=[Mock(message=Mock(content='["validation", "input_handling"]'))]
+    )
+    
     current_state = {
         'files': ['src/app.py'],
         'frameworks': ['python'],
@@ -608,3 +618,31 @@ def test_pattern_confidence_thresholds():
     assert learner.should_explore_pattern(new_pattern) == (
         learner.get_pattern_confidence(new_pattern) >= 0.3
     )
+
+from typing import List, Dict, Any
+from unittest.mock import Mock
+import numpy as np
+
+class MockLearner:
+    """Mock learner for testing"""
+    def __init__(self):
+        self.client = None  # No need for real OpenAI client
+        self.mock_responses = {}
+
+    def compute_embedding(self, text: str) -> List[float]:
+        """Return mock embedding"""
+        return [0.0] * 1536  # OpenAI embeddings are 1536-dimensional
+
+    def plan_next_action(self, current_state: Dict[str, Any], instruction: str, 
+                        history: List[Dict[str, Any]], examples: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Return a mock action"""
+        return {
+            'type': 'edit_file',
+            'path': 'test.py',
+            'content': '# Mock content'
+        }
+
+    def _get_pattern_suggestions(self, instruction: str, current_state: Dict[str, Any], 
+                               examples: List[Dict[str, Any]]) -> List[str]:
+        """Return mock pattern suggestions"""
+        return ['validation', 'input_handling']

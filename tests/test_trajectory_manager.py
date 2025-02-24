@@ -5,11 +5,11 @@ from ai_agent.data.trajectory_manager import TrajectoryManager, Trajectory
 from ai_agent.data.sequence import ActionSequence, SequencePattern
 from ai_agent.environment.git_env import GitEnvironment
 from ai_agent.data.quality_metrics import QualityScore
+from tests.test_learner import MockLearner
 
-class MockLearner:
-    def compute_embedding(self, text: str) -> np.ndarray:
-        """Mock embedding computation for testing"""
-        return np.ones(10)  # Return a simple embedding vector
+@pytest.fixture
+def mock_learner():
+    return MockLearner()
 
 def test_hybrid_retrieval(tmp_path):
     manager = TrajectoryManager(str(tmp_path), learner=MockLearner())
@@ -82,9 +82,9 @@ def test_simple_tokenize():
     assert "add" in tokens
 
 @pytest.fixture
-def trajectory_manager_with_data(tmp_path):
+def trajectory_manager_with_data(tmp_path, mock_learner):
     """Create a trajectory manager with test data"""
-    manager = TrajectoryManager(str(tmp_path))
+    manager = TrajectoryManager(str(tmp_path), learner=mock_learner)
     
     # Add test trajectories for different patterns
     create_trajectory = Trajectory(

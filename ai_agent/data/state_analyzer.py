@@ -4,6 +4,7 @@ from pathlib import Path
 import difflib
 import json
 from collections import defaultdict
+import time
 
 @dataclass
 class StateChange:

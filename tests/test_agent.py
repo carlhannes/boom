@@ -89,42 +89,49 @@ class MockLearner:
             'status': 'complete'
         }
 
+import pytest
+from pathlib import Path
+import git
+from ai_agent.core.agent import CodingAgent
+from ai_agent.environment.git_env import GitEnvironment
+from tests.test_learner import MockLearner
+
+def init_git_repo(path: Path):
+    """Initialize a Git repository with initial commit"""
+    repo = git.Repo.init(path)
+    # Create initial commit
+    readme = path / "README.md"
+    readme.write_text("# Test Repository")
+    repo.index.add(["README.md"])
+    repo.index.commit("Initial commit")
+    return repo
+
 @pytest.fixture
 def mock_repo(tmp_path):
-    """Create a temporary Git repository"""
+    """Create a mock Git repository"""
     repo_path = tmp_path / "test_repo"
     repo_path.mkdir()
-    repo = git.Repo.init(repo_path)
-    
-    # Create some test files
-    (repo_path / "test.py").write_text("# Initial content")
-    (repo_path / "README.md").write_text("# Test Repository")
-    
-    # Initial commit
-    repo.index.add(["test.py", "README.md"])
-    repo.index.commit("Initial commit")
-    
-    return repo_path
+    return init_git_repo(repo_path)
 
 @pytest.fixture
 def mock_storage(tmp_path):
-    """Create temporary storage path"""
+    """Create a mock storage directory"""
     storage_path = tmp_path / "trajectories"
     storage_path.mkdir()
     return storage_path
 
 @pytest.fixture
 def mock_learner():
-    """Create a mock learner instance"""
+    """Create a mock learner"""
     return MockLearner()
 
 def test_agent_initialization(mock_repo, mock_storage, mock_learner):
     """Test agent initialization with custom BM25 settings"""
-    agent = CodingAgent(str(mock_repo), str(mock_storage), bm25_top_k=100, api_key="mock-key")
+    agent = CodingAgent(str(mock_repo.working_dir), str(mock_storage), bm25_top_k=100, api_key="mock-key")
     agent.set_learner(mock_learner)  # Use new set_learner method
     assert agent.bm25_top_k == 100
     assert isinstance(agent.environment, GitEnvironment)
-    assert agent.environment.repo_path == mock_repo
+    assert agent.environment.repo_path == mock_repo.working_dir
 
 def test_agent_task_execution_with_retrieval(mock_repo, mock_storage, mock_learner):
     """Test task execution with hybrid retrieval system"""
@@ -145,7 +152,7 @@ def test_agent_task_execution_with_retrieval(mock_repo, mock_storage, mock_learn
     ]
     
     # Set up agent with mock components
-    agent = CodingAgent(str(mock_repo), str(mock_storage), bm25_top_k=10, api_key="mock-key")
+    agent = CodingAgent(str(mock_repo.working_dir), str(mock_storage), bm25_top_k=10, api_key="mock-key")
     agent.set_learner(mock_learner)  # Use new set_learner method
     
     # Store example trajectories
@@ -163,7 +170,7 @@ def test_agent_task_execution_with_retrieval(mock_repo, mock_storage, mock_learn
 
 def test_agent_with_empty_repository(mock_repo, mock_storage, mock_learner):
     """Test agent behavior with no existing trajectories"""
-    agent = CodingAgent(str(mock_repo), str(mock_storage), api_key="mock-key")
+    agent = CodingAgent(str(mock_repo.working_dir), str(mock_storage), api_key="mock-key")
     agent.set_learner(mock_learner)  # Use new set_learner method
     
     trajectory = agent.execute_task("Create new file")
@@ -173,7 +180,7 @@ def test_agent_with_empty_repository(mock_repo, mock_storage, mock_learner):
 
 def test_agent_retrieval_ranking(mock_repo, mock_storage, mock_learner):
     """Test that hybrid retrieval properly ranks results"""
-    agent = CodingAgent(str(mock_repo), str(mock_storage), api_key="mock-key")
+    agent = CodingAgent(str(mock_repo.working_dir), str(mock_storage), api_key="mock-key")
     agent.set_learner(mock_learner)  # Use new set_learner method
     
     # Create trajectories with varying similarity
@@ -219,7 +226,7 @@ def test_agent_retrieval_ranking(mock_repo, mock_storage, mock_learner):
 
 def test_retrieval_reranking_decision(mock_repo, mock_storage, mock_learner):
     """Test that re-ranking is selectively applied based on query type"""
-    agent = CodingAgent(str(mock_repo), str(mock_storage), api_key="mock-key")
+    agent = CodingAgent(str(mock_repo.working_dir), str(mock_storage), api_key="mock-key")
     agent.set_learner(mock_learner)
 
     # Test cases that should skip re-ranking
@@ -252,7 +259,7 @@ def test_retrieval_reranking_decision(mock_repo, mock_storage, mock_learner):
 
 def test_bm25_score_threshold(mock_repo, mock_storage, mock_learner):
     """Test that high BM25 scores bypass re-ranking"""
-    agent = CodingAgent(str(mock_repo), str(mock_storage), api_key="mock-key")
+    agent = CodingAgent(str(mock_repo.working_dir), str(mock_storage), api_key="mock-key")
     agent.set_learner(mock_learner)
     
     # Create a trajectory with exact match to query

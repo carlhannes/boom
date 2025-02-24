@@ -7,6 +7,7 @@ from rank_bm25 import BM25Okapi
 from ..core.learner import SelfLearner
 from .quality_metrics import QualityMetrics, QualityScore
 from .state_analyzer import StateChangeAnalyzer, StateChange
+from .sequence import SequencePattern, ActionSequence
 
 class TrajectoryQualityMetrics:
     """Metrics for assessing trajectory quality"""
@@ -139,7 +140,12 @@ class TrajectoryManager:
 
     def rebuild_index(self):
         """Build BM25 index from stored trajectories"""
-        self.trajectories = self.load_trajectories()
+        if not hasattr(self, 'trajectories'):
+            self.trajectories = []
+        
+        stored = self.load_trajectories()
+        if stored:
+            self.trajectories.extend(stored)
         
         # Filter low-quality trajectories
         filtered_trajectories = []
@@ -150,14 +156,16 @@ class TrajectoryManager:
         
         self.trajectories = filtered_trajectories
         
-        if not self.trajectories:
-            return
-            
-        # Prepare documents for BM25
+        # Build BM25 index
         tokenized_docs = []
-        for traj in self.trajectories:
-            tokens = simple_tokenize(traj.instruction)
-            tokenized_docs.append(tokens)
+        if self.trajectories:
+            # Prepare documents for BM25
+            for traj in self.trajectories:
+                tokens = simple_tokenize(traj.instruction)
+                tokenized_docs.append(tokens)
+        else:
+            # Add a dummy document to avoid division by zero
+            tokenized_docs.append(['dummy'])
             
         self.bm25_index = BM25Okapi(tokenized_docs)
     
@@ -395,10 +403,9 @@ class TrajectoryManager:
                                    current_state: Dict[str, Any],
                                    instruction: str,
                                    limit: int = 5,
+                                   min_quality: float = 0.7,
                                    bm25_top_k: int = 50) -> List[Trajectory]:
-        """
-        Enhanced retrieval with agentic state matching and context awareness
-        """
+        """Enhanced retrieval with hybrid matching including state patterns and BM25"""
         if not self.trajectories:
             return []
             
@@ -411,6 +418,14 @@ class TrajectoryManager:
         max_score = max(bm25_scores) if any(bm25_scores) else 1.0
         top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
         
+        # Get current changes if available
+        current_changes = []
+        if hasattr(current_state, 'previous_state'):
+            current_changes = self.state_analyzer.analyze_change(
+                current_state.get('previous_state', {}),
+                current_state
+            )
+        
         scored_candidates = []
         
         for idx in top_k_indices:
@@ -419,11 +434,22 @@ class TrajectoryManager:
             # Calculate different similarity components
             bm25_score = bm25_scores[idx] / max_score
             
-            # Compute state similarity score
-            state_sim = self._compute_state_similarity(
-                current_state,
-                traj.final_state
-            )
+            # Get trajectory's state changes
+            trajectory_changes = getattr(traj, 'state_changes', [])
+            
+            # Calculate state pattern similarity if we have current changes
+            state_similarity = 0.0
+            if current_changes and trajectory_changes:
+                similar_patterns = self.state_analyzer.get_similar_changes(
+                    current_changes,
+                    threshold=0.6
+                )
+                if similar_patterns:
+                    max_similarity = max(
+                        self._calculate_change_similarity(current_changes, pattern)
+                        for pattern in similar_patterns
+                    )
+                    state_similarity = max_similarity
             
             # Get environment context match
             context_sim = self._compute_context_match(
@@ -443,70 +469,23 @@ class TrajectoryManager:
                 query_embedding = self.learner.compute_embedding(instruction)
                 semantic_sim = np.dot(query_embedding, traj._embedding)
             
-            # Combine scores with learned weights
-            final_score = (
-                0.3 * bm25_score +        # Text similarity
-                0.2 * state_sim +         # State matching
-                0.2 * context_sim +       # Environment context
-                0.2 * action_score +      # Action applicability
-                0.1 * semantic_sim        # Semantic similarity
-            )
-            
-            scored_candidates.append((final_score, traj))
-        
-        # Sort by final score and return top trajectories
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in scored_candidates[:limit]]
-
-    def retrieve_similar_trajectories(self,
-                                   current_state: Dict[str, Any],
-                                   instruction: str,
-                                   limit: int = 5,
-                                   min_quality: float = 0.7) -> List['Trajectory']:
-        """Enhanced retrieval with state change pattern matching"""
-        base_candidates = super().retrieve_similar_trajectories(
-            current_state,
-            instruction,
-            limit=limit * 2
-        )
-        
-        # Get current changes if available
-        current_changes = []
-        if hasattr(current_state, 'previous_state'):
-            current_changes = self.state_analyzer.analyze_change(
-                current_state.previous_state,
-                current_state
-            )
-        
-        # Score candidates with state pattern matching
-        scored_candidates = []
-        for trajectory in base_candidates:
-            # Get trajectory's state changes
-            trajectory_changes = getattr(trajectory, 'state_changes', [])
-            
-            # Calculate state pattern similarity if we have current changes
-            state_similarity = 0.0
-            if current_changes and trajectory_changes:
-                similar_patterns = self.state_analyzer.get_similar_changes(
-                    current_changes,
-                    threshold=0.6
-                )
-                if similar_patterns:
-                    max_similarity = max(
-                        self._calculate_change_similarity(current_changes, pattern)
-                        for pattern in similar_patterns
-                    )
-                    state_similarity = max_similarity
-            
-            # Get base quality score
+            # Get quality score
             quality_score = self.get_trajectory_quality(
-                self.trajectories.index(trajectory)
+                self.trajectories.index(traj)
             )
             
             if quality_score and quality_score.total_score >= min_quality:
-                # Combine quality score with state similarity
-                final_score = quality_score.total_score * (1 + 0.5 * state_similarity)
-                scored_candidates.append((final_score, trajectory))
+                # Combine all scores with weights
+                final_score = (
+                    0.25 * bm25_score +           # Text similarity
+                    0.20 * state_similarity +      # State change patterns
+                    0.20 * context_sim +          # Environment context
+                    0.15 * action_score +         # Action applicability  
+                    0.10 * semantic_sim +         # Semantic similarity
+                    0.10 * quality_score.total_score  # Trajectory quality
+                )
+                
+                scored_candidates.append((final_score, traj))
         
         # Sort by final score and return top results
         scored_candidates.sort(key=lambda x: x[0], reverse=True)

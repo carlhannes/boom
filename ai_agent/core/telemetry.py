@@ -20,18 +20,16 @@ class TelemetryManager:
     """Manages learning telemetry and analytics"""
     
     def __init__(self, storage_path: str):
-        self.storage_path = Path(storage_path)
+        self.storage_path = storage_path
+        self.pattern_stats = {}  # Now initialized as empty dict
+        self.total_executions = 0
+        self.successful_executions = 0
         self.metrics_history: List[LearningMetrics] = []
-        self.pattern_stats = defaultdict(lambda: {
-            'uses': 0,
-            'successes': 0,
-            'impact_sum': 0.0
-        })
         self._load_history()
     
     def _load_history(self) -> None:
         """Load existing metrics history"""
-        metrics_file = self.storage_path / 'metrics_history.json'
+        metrics_file = Path(self.storage_path) / 'metrics_history.json'
         if metrics_file.exists():
             try:
                 with open(metrics_file) as f:
@@ -59,6 +57,12 @@ class TelemetryManager:
         impact = np.mean([c.impact for c in getattr(trajectory, 'state_changes', [])])
         
         # Update pattern statistics
+        if pattern_key not in self.pattern_stats:
+            self.pattern_stats[pattern_key] = {
+                'uses': 0,
+                'successes': 0,
+                'impact_sum': 0.0
+            }
         self.pattern_stats[pattern_key]['uses'] += 1
         if success:
             self.pattern_stats[pattern_key]['successes'] += 1
@@ -117,8 +121,8 @@ class TelemetryManager:
     
     def _save_history(self) -> None:
         """Save metrics history to file"""
-        self.storage_path.mkdir(parents=True, exist_ok=True)
-        metrics_file = self.storage_path / 'metrics_history.json'
+        Path(self.storage_path).mkdir(parents=True, exist_ok=True)
+        metrics_file = Path(self.storage_path) / 'metrics_history.json'
         
         with open(metrics_file, 'w') as f:
             json.dump([{
@@ -131,22 +135,29 @@ class TelemetryManager:
             } for m in self.metrics_history], f, indent=2)
     
     def get_learning_summary(self) -> Dict[str, Any]:
-        """Get summary of learning progress"""
-        if not self.metrics_history:
+        """Get summary statistics of learning progress"""
+        if not self.pattern_stats:
             return {
-                'status': 'No learning data available',
                 'total_patterns': 0,
-                'success_rate': 0.0
+                'successful_patterns': 0,
+                'avg_impact': 0.0,
+                'success_rate': 0.0,
+                'total_trajectories': 0
             }
-            
-        latest = self.metrics_history[-1]
+
+        successful_patterns = sum(1 for stats in self.pattern_stats.values() 
+                                if stats['successes'] > 0)
+        
+        total_impact = sum(stats['impact_sum'] for stats in self.pattern_stats.values())
+        total_uses = sum(stats['uses'] for stats in self.pattern_stats.values())
+        
         return {
             'total_patterns': len(self.pattern_stats),
-            'total_trajectories': latest.total_trajectories,
-            'success_rate': latest.successful_trajectories / max(1, latest.total_trajectories),
-            'pattern_confidence': latest.pattern_confidence,
-            'average_impact': latest.average_impact,
-            'exploration_rate': latest.exploration_rate
+            'successful_patterns': successful_patterns,
+            'avg_impact': total_impact / total_uses if total_uses > 0 else 0.0,
+            'success_rate': self.successful_executions / self.total_executions 
+                          if self.total_executions > 0 else 0.0,
+            'total_trajectories': total_uses
         }
     
     def get_pattern_performance(self) -> Dict[str, Dict[str, float]]:
