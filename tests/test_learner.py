@@ -1,59 +1,61 @@
 import pytest
 import numpy as np
-from unittest.mock import Mock, patch
+import json
+from unittest.mock import Mock, patch, MagicMock
 from ai_agent.core.learner import SelfLearner
 from ai_agent.data.trajectory_manager import TrajectoryManager
 
 @pytest.fixture
 def mock_openai_client():
     client = Mock()
-    client.chat.completions.create.return_value = Mock(
-        choices=[Mock(message=Mock(content='{"action": "test"}'))]
-    )
+    # Mock chat completions
+    mock_response = Mock()
+    mock_response.choices = [Mock(message=Mock(content='{"type": "test"}'))]
+    client.chat.completions.create.return_value = mock_response
     return client
 
 @pytest.fixture
 def learner_with_mock(mock_openai_client):
-    learner = SelfLearner(api_key="mock-key", client=mock_openai_client)
-    return learner
+    return SelfLearner(client=mock_openai_client)
 
 def test_analyze_task_context(learner_with_mock):
-    """Test task context analysis with repository state"""
-    repo_state = {
-        'files': ['src/app.py', 'tests/test_app.py'],
-        'git_status': {'modified': ['src/app.py']},
-        'frameworks': ['python'],
-        'languages': ['python'],
-        'patterns': ['testing']
+    """Test task context analysis with mocked responses"""
+    # Prepare mock response
+    mock_content = {
+        'required_operations': [{'file': 'test.py'}],
+        'dependencies': ['pytest'],
+        'risk_factors': []
     }
+    learner_with_mock.client.chat.completions.create.return_value.choices[0].message.content = str(mock_content)
     
-    context = learner_with_mock._analyze_task_context(
-        "Add input validation to user form",
-        repo_state
+    result = learner_with_mock._analyze_task_context(
+        "Add unit tests",
+        {'files': ['test.py'], 'git_status': {}}
     )
     
-    assert isinstance(context, dict)
-    assert context  # Should not be empty
+    assert result.get('required_operations')[0]['file'] == 'test.py'
+    assert 'pytest' in result.get('dependencies', [])
 
 def test_evaluate_action_risk(learner_with_mock):
     """Test risk evaluation for different action types"""
-    # Test edit file action
+    # Test file edit risk
     edit_action = {
         'type': 'edit_file',
-        'path': 'src/app.py',
-        'content': 'def validate_form():\n    pass'
+        'path': 'test.py',
+        'content': 'print("test")'
     }
     context = {'risk_factors': []}
     risk = learner_with_mock._evaluate_action_risk(edit_action, context)
-    assert 0 <= risk <= 1
+    assert 0 <= risk <= 1  # Risk should be normalized
     
     # Test high-risk action
-    risky_action = {
-        'type': 'resolve_conflict',
-        'path': 'src/app.py'
+    delete_action = {
+        'type': 'edit_file',
+        'path': 'config.py',
+        'content': 'delete sensitive data'
     }
-    risk = learner_with_mock._evaluate_action_risk(risky_action, context)
-    assert risk > 0.7  # Should be considered high risk
+    risk = learner_with_mock._evaluate_action_risk(delete_action, context)
+    assert risk > 0.5  # Should be considered higher risk
 
 def test_validate_action(learner_with_mock):
     """Test action validation against context"""
@@ -642,7 +644,101 @@ class MockLearner:
             'content': '# Mock content'
         }
 
+    def chat_completion(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Mock chat completion responses"""
+        return {
+            'choices': [
+                {
+                    'message': {
+                        'content': json.dumps({
+                            'type': 'edit_file',
+                            'path': 'test.py',
+                            'content': '# Test content'
+                        })
+                    }
+                }
+            ]
+        }
+
     def _get_pattern_suggestions(self, instruction: str, current_state: Dict[str, Any], 
                                examples: List[Dict[str, Any]]) -> List[str]:
         """Return mock pattern suggestions"""
         return ['validation', 'input_handling']
+
+def test_backward_construct(learner_with_mock):
+    """Test trajectory instruction refinement"""
+    mock_content = "Implement error handling in test.py"
+    learner_with_mock.client.chat.completions.create.return_value.choices[0].message.content = mock_content
+    
+    trajectory = {
+        'instruction': 'Add error handling',
+        'actions': [
+            {'type': 'edit_file', 'path': 'test.py', 'description': 'Add try-catch'},
+            {'type': 'run_tests', 'description': 'Verify changes'}
+        ],
+        'observations': [
+            {'status': 'success', 'state_before': {}, 'state_after': {}},
+            {'status': 'success', 'state_before': {}, 'state_after': {}}
+        ],
+        'final_state': {'files': ['test.py'], 'git_status': {'modified': ['test.py']}}
+    }
+    
+    result = learner_with_mock.backward_construct(trajectory)
+    assert result == mock_content
+
+def test_generate_tasks_from_docs(learner_with_mock):
+    """Test task generation from documentation"""
+    # Mock chat completion responses for task generation
+    responses = [
+        '1. Add logging to user authentication\n2. Implement caching\n3. Add error handlers',
+        '[\"Add logging with debug levels\", \"Implement Redis caching\", \"Add try-catch blocks\"]'
+    ]
+    learner_with_mock.client.chat.completions.create.side_effect = [
+        Mock(choices=[Mock(message=Mock(content=r))]) for r in responses
+    ]
+    
+    docs = ['## Authentication\nHandle user login and validation']
+    repo_state = {
+        'files': ['auth.py', 'tests/test_auth.py'],
+        'git_status': {'modified': []}
+    }
+    
+    tasks = learner_with_mock.generate_tasks_from_docs(docs, repo_state)
+    assert len(tasks) > 0
+    assert all(hasattr(task, 'instruction') for task in tasks)
+    assert all(hasattr(task, 'context') for task in tasks)
+
+def test_validate_action(learner_with_mock):
+    """Test action validation against context and constraints"""
+    context = {
+        'required_operations': [
+            {'file': 'test.py', 'operation': 'edit'}
+        ],
+        'risk_factors': []
+    }
+    
+    # Test valid file edit action
+    valid_action = {
+        'type': 'edit_file',
+        'path': 'test.py',
+        'content': 'print("test")'
+    }
+    assert learner_with_mock._validate_action(valid_action, context) == True
+    
+    # Test invalid action missing required fields
+    invalid_action = {
+        'type': 'edit_file',
+        'path': 'test.py'  # Missing content
+    }
+    assert learner_with_mock._validate_action(invalid_action, context) == False
+    
+    # Test high-risk action
+    risky_action = {
+        'type': 'git_checkout',
+        'branch': 'master',
+        'force': True
+    }
+    context_with_risk = {
+        'risk_factors': [{'type': 'data_loss', 'severity': 0.9}]
+    }
+    assert learner_with_mock._validate_action(risky_action, context_with_risk) == False

@@ -108,22 +108,32 @@ def init_git_repo(path: Path):
 
 @pytest.fixture
 def mock_repo(tmp_path):
-    """Create a mock Git repository"""
+    """Setup a test git repository"""
     repo_path = tmp_path / "test_repo"
     repo_path.mkdir()
-    return init_git_repo(repo_path)
+    repo = git.Repo.init(repo_path)
+    
+    # Create and commit an initial file
+    (repo_path / "README.md").write_text("# Test Repository")
+    repo.index.add(["README.md"])
+    repo.index.commit("Initial commit")
+    repo.create_head('main')
+    
+    return repo
 
 @pytest.fixture
 def mock_storage(tmp_path):
-    """Create a mock storage directory"""
+    """Setup storage path for trajectories"""
     storage_path = tmp_path / "trajectories"
     storage_path.mkdir()
     return storage_path
 
 @pytest.fixture
 def mock_learner():
-    """Create a mock learner"""
-    return MockLearner()
+    """Setup mock learner for testing"""
+    learner = MockLearner()
+    learner.backward_construct = lambda x: "Refined: " + x['instruction']
+    return learner
 
 def test_agent_initialization(mock_repo, mock_storage, mock_learner):
     """Test agent initialization with custom BM25 settings"""

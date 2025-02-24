@@ -1,10 +1,13 @@
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 import json
 import time
 from pathlib import Path
 import numpy as np
 from rank_bm25 import BM25Okapi
-from ..core.learner import SelfLearner
+
+# Only for type hints
+if TYPE_CHECKING:
+    from ..core.learner import SelfLearner
 from .quality_metrics import QualityMetrics, QualityScore
 from .state_analyzer import StateChangeAnalyzer, StateChange
 from .sequence import SequencePattern, ActionSequence
@@ -133,10 +136,15 @@ class TrajectoryManager:
         self.bm25_index = None
         self.trajectories = []
         self.min_quality_threshold = 0.5  # Minimum quality score to keep trajectory
-        self.rebuild_index()
         self.quality_metrics = QualityMetrics()
         self.trajectory_scores: Dict[int, QualityScore] = {}
         self.state_analyzer = StateChangeAnalyzer()
+        
+        # Load existing trajectories
+        stored = self.load_trajectories()
+        if stored:
+            self.trajectories.extend(stored)
+            self.rebuild_index()  # Only build index if we have trajectories
 
     def rebuild_index(self):
         """Build BM25 index from stored trajectories"""
@@ -504,13 +512,18 @@ class TrajectoryManager:
         
         for c1 in changes1:
             for c2 in changes2:
-                if (c1.type == c2.type and
-                    abs(c1.impact - c2.impact) < 0.3 and
-                    (c1.path == c2.path or
-                     Path(c1.path).suffix == Path(c2.path).suffix)):
+                # Type match (0.7 weight)
+                type_match = 0.7 if c1.type == c2.type else 0.0
+                
+                # Impact similarity (0.3 weight)
+                impact_diff = abs(c1.impact - c2.impact)
+                impact_sim = 0.3 * (1.0 - min(1.0, impact_diff))
+                
+                # Combined similarity for this pair
+                if type_match + impact_sim > 0.5:  # Only count if reasonably similar
                     matches += 1
-                    break
-        
+                    break  # Move to next c1
+                    
         return matches / total
 
     def _compute_context_match(self,

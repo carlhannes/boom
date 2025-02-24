@@ -84,7 +84,11 @@ class SequencePattern:
     def __init__(self, sequences: List[ActionSequence]):
         self.sequences = sequences
         self.success_rate = self._calculate_pattern_success()
+        self.avg_success_rate = self.success_rate  # Alias for test compatibility
         self.common_steps = self._extract_common_steps()
+        self.frequency = len(sequences)  # Add frequency attribute
+        # Inherit semantic type from sequences if they share one
+        self.semantic_type = sequences[0].semantic_type if sequences and all(s.semantic_type == sequences[0].semantic_type for s in sequences) else 'mixed'
 
     def _calculate_pattern_success(self) -> float:
         """Calculate overall success rate of the pattern"""

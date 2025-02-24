@@ -66,7 +66,9 @@ class TelemetryManager:
         self.pattern_stats[pattern_key]['uses'] += 1
         if success:
             self.pattern_stats[pattern_key]['successes'] += 1
+            self.successful_executions += 1  # Track successful executions
         self.pattern_stats[pattern_key]['impact_sum'] += impact
+        self.total_executions += 1  # Track total executions
         
         # Record overall metrics
         self._record_metrics(success, impact, was_exploration)
@@ -145,18 +147,18 @@ class TelemetryManager:
                 'total_trajectories': 0
             }
 
+        total_uses = sum(stats['uses'] for stats in self.pattern_stats.values())
+        total_successes = sum(stats['successes'] for stats in self.pattern_stats.values())
+        total_impact = sum(stats['impact_sum'] for stats in self.pattern_stats.values())
+        
         successful_patterns = sum(1 for stats in self.pattern_stats.values() 
                                 if stats['successes'] > 0)
-        
-        total_impact = sum(stats['impact_sum'] for stats in self.pattern_stats.values())
-        total_uses = sum(stats['uses'] for stats in self.pattern_stats.values())
         
         return {
             'total_patterns': len(self.pattern_stats),
             'successful_patterns': successful_patterns,
             'avg_impact': total_impact / total_uses if total_uses > 0 else 0.0,
-            'success_rate': self.successful_executions / self.total_executions 
-                          if self.total_executions > 0 else 0.0,
+            'success_rate': total_successes / total_uses if total_uses > 0 else 0.0,
             'total_trajectories': total_uses
         }
     
