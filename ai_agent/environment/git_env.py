@@ -46,11 +46,19 @@ class GitEnvironment:
     
     def _get_merge_conflicts(self) -> List[str]:
         """Get list of files with merge conflicts"""
-        return [
-            item.a_path 
-            for item in self.repo.index.diff(None)
-            if item.a_blob.path_is_merge_conflict
-        ]
+        if not self.repo.head.is_valid():
+            return []
+            
+        conflicted_files = []
+        for item in self.repo.index.diff(None):
+            try:
+                content = item.a_blob.data_stream.read().decode('utf-8')
+                if '<<<<<<< HEAD' in content and '>>>>>>>' in content:
+                    conflicted_files.append(item.a_path)
+            except (AttributeError, UnicodeDecodeError):
+                continue
+                
+        return conflicted_files
     
     def _get_last_commit_info(self) -> Dict[str, Any]:
         """Get information about the last commit"""

@@ -39,6 +39,10 @@ class CodingAgent:
             bm25_top_k=self.bm25_top_k  # First-stage retrieval size
         )
         
+        # If we have a very close match, reuse its actions
+        if similar_trajectories and similar_trajectories[0].instruction == instruction:
+            return similar_trajectories[0]
+            
         # Initialize trajectory
         trajectory = Trajectory(
             instruction=instruction,

@@ -1,31 +1,54 @@
-# AI Coding Agent (BOOM)
+# AI Agent
 
-An AI coding agent based on Learn-by-interact principles that autonomously performs coding tasks in Git repositories. The agent learns from its interactions with the codebase and improves its performance through trajectory-based learning.
-
-## Key Features
-
-- Task generation from documentation
-- Execution trajectory recording
-- Backward construction of instructions
-- Similarity-based trajectory retrieval
-- Git repository interaction
-- OpenAI GPT integration
+AI coding agent based on Learn-by-interact principles.
 
 ## Installation
 
-The project uses Poetry for dependency management. Key dependencies are specified in `pyproject.toml`.
-
-Required Python version: ^3.9
-
+1. Clone the repository:
 ```bash
-poetry install
+git clone <repository-url>
+cd ai-agent
 ```
 
-Main dependencies:
-- openai ^1.0.0
-- gitpython ^3.1.0
-- numpy ^1.26.0
-- pytest ^7.0.0
+2. Create a virtual environment:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## ARM64 (Apple Silicon) Users
+
+For ARM64 architectures (e.g., Apple Silicon Macs), if you encounter any issues with scipy installation, pre-compiled wheels are available in the `wheels` directory. These can be installed with:
+
+```bash
+pip install wheels/numpy-2.2.3-cp312-cp312-macosx_14_0_arm64.whl
+pip install wheels/scipy-1.13.1-cp312-cp312-macosx_12_0_arm64.whl
+```
+
+## Development
+
+1. Setup development environment:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+2. Run tests:
+```bash
+pytest
+```
+
+3. Format code:
+```bash
+black .
+isort .
+```
 
 ## Getting Started
 
@@ -47,4 +70,4 @@ See the `examples/demo.py` file for example usage of the agent.
 
 ## License
 
-See [LICENSE.md](LICENSE.md) for details.
+See [LICENSE](LICENSE) file.

@@ -3,8 +3,8 @@ from typing import List, Dict, Any, Optional
 import json
 from pathlib import Path
 import numpy as np
+from openai import OpenAI
 import os
-from openai import OpenAI, OpenAIError
 from sentence_transformers import SentenceTransformer
 
 @dataclass
@@ -30,7 +30,7 @@ class SelfLearner:
         else:
             try:
                 self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-            except OpenAIError as e:
+            except Exception as e:
                 # For testing without API key
                 if api_key == "mock-key":
                     self.client = None
@@ -46,6 +46,64 @@ class SelfLearner:
             else:
                 raise e
 
+    def generate_tasks_from_docs(self, docs: List[str]) -> List[TaskExample]:
+        """Generate tasks by analyzing documentation"""
+        tasks = []
+        for doc in docs:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a coding agent that generates realistic coding tasks "
+                        "from documentation. Generate specific, actionable tasks that "
+                        "could be performed in a codebase."
+                    )},
+                    {"role": "user", "content": f"Generate 3 specific coding tasks based on this documentation:\n\n{doc}"}
+                ]
+            )
+            
+            # Parse tasks from response
+            task_text = response.choices[0].message.content
+            for line in task_text.split('\n'):
+                if line.strip():
+                    tasks.append(TaskExample(
+                        instruction=line.strip(),
+                        context={"source_doc": doc}
+                    ))
+        
+        return tasks
+    
+    def backward_construct(self, trajectory: Dict[str, Any]) -> str:
+        """
+        Given a trajectory of actions and observations, construct a precise
+        instruction that matches what actually happened
+        """
+        # Construct prompt with the full trajectory
+        actions_text = "\n".join(
+            f"Action {i+1}: {action['type']} - {action.get('description', '')}"
+            for i, action in enumerate(trajectory['actions'])
+        )
+        
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a coding agent that writes precise instructions "
+                    "based on actual sequences of actions taken in a codebase. "
+                    "Write a single, specific instruction that accurately describes "
+                    "the sequence of actions, focusing on what was actually done."
+                )},
+                {"role": "user", "content": (
+                    f"Original instruction: {trajectory['instruction']}\n\n"
+                    f"Actual actions taken:\n{actions_text}\n\n"
+                    "Write a single instruction that precisely describes what "
+                    "these actions accomplished:"
+                )}
+            ]
+        )
+        
+        return response.choices[0].message.content.strip()
+    
     def compute_embedding(self, text: str) -> np.ndarray:
         """Compute embedding for a text using Sentence Transformers model"""
         if self.embedding_model is None:
@@ -54,60 +112,7 @@ class SelfLearner:
             
         # Get embeddings using Sentence Transformers
         return self.embedding_model.encode(text, convert_to_numpy=True)
-
-    def generate_tasks_from_docs(self, docs: List[str]) -> List[TaskExample]:
-        """Generate tasks by analyzing documentation"""
-        if not self.client:
-            # For testing
-            return [TaskExample(instruction=doc, context={}) for doc in docs]
-            
-        examples = []
-        for doc in docs:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": (
-                        "You are an expert at generating coding tasks from documentation. "
-                        "Extract concrete, actionable tasks that can be performed."
-                    )},
-                    {"role": "user", "content": f"Generate a specific coding task from this documentation:\n{doc}"}
-                ]
-            )
-            
-            instruction = response.choices[0].message.content.strip()
-            examples.append(TaskExample(instruction=instruction, context={"doc": doc}))
-            
-        return examples
-
-    def backward_construct(self, trajectory: Dict[str, Any]) -> str:
-        """Construct a clear instruction from the completed trajectory
-        
-        This helps improve future retrievals by generating high-quality task descriptions
-        that capture what was actually done, rather than just the initial instruction.
-        """
-        if not self.client:
-            # For testing
-            return trajectory.get('instruction', '')
-        
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": (
-                    "You are an expert at describing coding changes. Given a sequence "
-                    "of actions and their results, write a clear instruction that "
-                    "describes what was accomplished."
-                )},
-                {"role": "user", "content": (
-                    "Here are the actions that were performed:\n"
-                    f"{json.dumps(trajectory.get('actions', []), indent=2)}\n\n"
-                    "Write a single instruction that precisely describes what "
-                    "these actions accomplished:"
-                )}
-            ]
-        )
-        
-        return response.choices[0].message.content.strip()
-
+    
     def retrieve_similar_trajectories(self,
                                    query: str,
                                    trajectories: List[Dict[str, Any]],

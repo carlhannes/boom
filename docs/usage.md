@@ -1,5 +1,19 @@
 # Usage Guide
 
+## Setup and Installation
+```bash
+# 1. Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# For ARM64 (Apple Silicon) users, if needed:
+pip install wheels/numpy-2.2.3-cp312-cp312-macosx_14_0_arm64.whl
+pip install wheels/scipy-1.13.1-cp312-cp312-macosx_12_0_arm64.whl
+```
+
 ## Basic Usage
 
 ```bash
@@ -180,6 +194,30 @@ Each trajectory file contains:
 | --repo-path, -r | . | Path to Git repository |
 | --storage-path, -s | ~/.ai-agent/trajectories | Path to store agent data |
 | --bm25-candidates, -k | 50 | Number of first-stage retrieval candidates |
+
+## Development Workflow
+
+1. Activate the virtual environment:
+```bash
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+```
+
+2. Running tests:
+```bash
+pytest
+```
+
+3. Code formatting:
+```bash
+black .
+isort .
+```
+
+4. Cleaning up:
+```bash
+# Remove cache files and virtual environment
+make clean
+```
 
 ## CLI Usage
 

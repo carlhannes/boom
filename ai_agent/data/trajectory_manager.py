@@ -165,12 +165,13 @@ class TrajectoryManager:
             self.rebuild_index()
             
         bm25_scores = self.bm25_index.get_scores(query_tokens)
-        top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:]
+        max_score = max(bm25_scores) if any(bm25_scores) else 1.0
+        top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
         
         # Decide whether to apply re-ranking
         if not self.should_apply_rerank(bm25_scores, instruction):
             # Return top BM25 results directly
-            return [self.trajectories[i] for i in top_k_indices[-limit:]]
+            return [self.trajectories[i] for i in top_k_indices[:limit]]
         
         # Stage 2: Re-ranking with embeddings and state similarity
         query_embedding = self.learner.compute_embedding(instruction)
@@ -180,7 +181,7 @@ class TrajectoryManager:
             traj = self.trajectories[idx]
             
             # Combine BM25 score (normalized), embedding similarity, and state similarity
-            bm25_score = bm25_scores[idx] / max(bm25_scores)
+            bm25_score = bm25_scores[idx] / max_score
             
             # Embedding similarity
             if not hasattr(traj, '_embedding') or traj._embedding is None:

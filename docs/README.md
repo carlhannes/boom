@@ -31,15 +31,16 @@ Handles storage and retrieval of execution trajectories, enabling learning from 
 
 ## Installation
 
-The project uses Poetry for dependency management. Key dependencies are specified in `pyproject.toml`.
+The project uses pip for dependency management. Key dependencies are specified in `requirements.txt`.
 
 Required Python version: ^3.9
 
 Main dependencies:
 - openai ^1.0.0
 - gitpython ^3.1.0
-- numpy ^1.26.0
-- pytest ^7.0.0
+- numpy ^2.2.3
+- scipy ^1.13.1
+- pytest ^8.3.4
 
 ## Getting Started
 
