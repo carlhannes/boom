@@ -265,88 +265,164 @@ class TrajectoryManager:
         quality_boost = 1.0 + (quality_score ** 2) * 0.5
         return base_score * quality_boost
 
+    def _extract_action_patterns(self) -> Dict[str, SequencePattern]:
+        """Extract common successful action patterns from stored trajectories"""
+        sequences = []
+        for trajectory in self.trajectories:
+            sequence = ActionSequence.from_trajectory(trajectory)
+            if sequence.success_rate > 0.8:  # Only consider highly successful trajectories
+                sequences.append(sequence)
+                
+        # Group sequences by semantic type
+        type_groups = {}
+        for seq in sequences:
+            if seq.semantic_type not in type_groups:
+                type_groups[seq.semantic_type] = []
+            type_groups[seq.semantic_type].append(seq)
+        
+        # Create patterns for each type
+        patterns = {}
+        for sem_type, type_sequences in type_groups.items():
+            if len(type_sequences) >= 2:  # Need at least 2 sequences to form a pattern
+                patterns[sem_type] = SequencePattern(type_sequences)
+                
+        return patterns
+
+    def _find_matching_patterns(self, query: str, current_state: Dict[str, Any]) -> List[ActionSequence]:
+        """Find action patterns that match the query and current state"""
+        patterns = self._extract_action_patterns()
+        
+        # Convert query to probable semantic types
+        query_lower = query.lower()
+        likely_types = set()
+        
+        if any(word in query_lower for word in ['create', 'add', 'new']):
+            likely_types.add('create')
+        if any(word in query_lower for word in ['edit', 'update', 'modify', 'change']):
+            likely_types.add('modify')
+        if any(word in query_lower for word in ['test', 'verify', 'check']):
+            likely_types.add('test')
+        if any(word in query_lower for word in ['fix', 'repair', 'resolve']):
+            likely_types.add('fix')
+        
+        matching_sequences = []
+        
+        # Check each pattern type that matches query semantics
+        for sem_type in likely_types:
+            if sem_type in patterns:
+                pattern = patterns[sem_type]
+                
+                # Get the best example from each matching pattern
+                example = pattern.get_best_example()
+                
+                # Verify state compatibility
+                if self._compute_state_similarity(
+                    current_state,
+                    example.steps[0].state_before
+                ) > 0.6:  # Reasonable state match threshold
+                    matching_sequences.append(example)
+        
+        return matching_sequences
+
     def retrieve_similar_trajectories(self,
                                    current_state: Dict[str, Any],
                                    instruction: str,
                                    limit: int = 5,
                                    bm25_top_k: int = 50) -> List[Trajectory]:
         """
-        Enhanced retrieval with context awareness and quality boosting
+        Enhanced retrieval with pattern matching and context awareness
         """
         if not self.trajectories:
             return []
         
-        # Stage 1: BM25 retrieval
-        query_tokens = simple_tokenize(instruction)
-        if not self.bm25_index:
-            self.rebuild_index()
-            
-        bm25_scores = self.bm25_index.get_scores(query_tokens)
-        max_score = max(bm25_scores) if any(bm25_scores) else 1.0
-        top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
+        # Stage 1: Pattern-based matching
+        pattern_matches = self._find_matching_patterns(instruction, current_state)
         
-        # Extract technical context from current state
-        query_context = {
-            'frameworks': current_state.get('frameworks', []),
-            'languages': current_state.get('languages', []),
-            'file_types': {Path(f).suffix[1:] for f in current_state.get('files', []) if Path(f).suffix},
-            'patterns': current_state.get('patterns', [])
-        }
+        # Convert pattern matches back to trajectories
+        pattern_trajectories = []
+        for sequence in pattern_matches:
+            # Find the original trajectory this sequence came from
+            for traj in self.trajectories:
+                if all(
+                    action == step.action
+                    for action, step in zip(traj.actions, sequence.steps)
+                ):
+                    pattern_trajectories.append(traj)
+                    break
         
-        # Decide whether to apply re-ranking
-        if not self.should_apply_rerank(bm25_scores, instruction):
-            # Even with BM25-only, still apply quality boosting
-            scored_trajectories = [
-                (self._boost_by_quality(bm25_scores[i] / max_score, self.trajectories[i]), self.trajectories[i])
-                for i in top_k_indices
-            ]
-            scored_trajectories.sort(key=lambda x: x[0], reverse=True)
-            return [t for _, t in scored_trajectories[:limit]]
-        
-        # Stage 2: Enhanced re-ranking
-        query_embedding = self.learner.compute_embedding(instruction)
-        scored_trajectories = []
-        
-        for idx in top_k_indices:
-            traj = self.trajectories[idx]
+        # Stage 2: Standard retrieval for remaining slots
+        remaining_slots = max(0, limit - len(pattern_trajectories))
+        if remaining_slots > 0:
+            query_tokens = simple_tokenize(instruction)
+            if not self.bm25_index:
+                self.rebuild_index()
+                
+            bm25_scores = self.bm25_index.get_scores(query_tokens)
+            max_score = max(bm25_scores) if any(bm25_scores) else 1.0
+            top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
             
-            # 1. Base scores
-            bm25_score = bm25_scores[idx] / max_score
+            # Extract technical context
+            query_context = {
+                'frameworks': current_state.get('frameworks', []),
+                'languages': current_state.get('languages', []),
+                'file_types': {Path(f).suffix[1:] for f in current_state.get('files', []) if Path(f).suffix},
+                'patterns': current_state.get('patterns', [])
+            }
             
-            # 2. Embedding similarity
-            if not hasattr(traj, '_embedding') or traj._embedding is None:
-                traj._embedding = self.learner.compute_embedding(traj.instruction)
-            embedding_sim = np.dot(query_embedding, traj._embedding)
+            if not self.should_apply_rerank(bm25_scores, instruction):
+                # BM25-only with quality boosting
+                scored_trajectories = [
+                    (self._boost_by_quality(bm25_scores[i] / max_score, self.trajectories[i]), self.trajectories[i])
+                    for i in top_k_indices
+                    if self.trajectories[i] not in pattern_trajectories
+                ]
+                scored_trajectories.sort(key=lambda x: x[0], reverse=True)
+                standard_matches = [t for _, t in scored_trajectories[:remaining_slots]]
+            else:
+                # Enhanced reranking
+                query_embedding = self.learner.compute_embedding(instruction)
+                scored_trajectories = []
+                
+                for idx in top_k_indices:
+                    traj = self.trajectories[idx]
+                    
+                    # Skip if already in pattern matches
+                    if traj in pattern_trajectories:
+                        continue
+                    
+                    # Calculate scores
+                    bm25_score = bm25_scores[idx] / max_score
+                    
+                    if not hasattr(traj, '_embedding') or traj._embedding is None:
+                        traj._embedding = self.learner.compute_embedding(traj.instruction)
+                    embedding_sim = np.dot(query_embedding, traj._embedding)
+                    
+                    state_sim = self._compute_state_similarity(current_state, traj.final_state)
+                    context_sim = self._compute_context_similarity(
+                        query_context,
+                        {
+                            'frameworks': traj.final_state.get('frameworks', []),
+                            'languages': traj.final_state.get('languages', []),
+                            'file_types': {Path(f).suffix[1:] for f in traj.final_state.get('files', []) if Path(f).suffix},
+                            'patterns': traj.final_state.get('patterns', [])
+                        }
+                    )
+                    
+                    base_score = (
+                        0.25 * bm25_score +
+                        0.30 * embedding_sim +
+                        0.25 * state_sim +
+                        0.20 * context_sim
+                    )
+                    
+                    final_score = self._boost_by_quality(base_score, traj)
+                    scored_trajectories.append((final_score, traj))
+                
+                scored_trajectories.sort(key=lambda x: x[0], reverse=True)
+                standard_matches = [t for _, t in scored_trajectories[:remaining_slots]]
             
-            # 3. State similarity
-            state_sim = self._compute_state_similarity(current_state, traj.final_state)
-            
-            # 4. Context similarity
-            context_sim = self._compute_context_similarity(
-                query_context,
-                {
-                    'frameworks': traj.final_state.get('frameworks', []),
-                    'languages': traj.final_state.get('languages', []),
-                    'file_types': {Path(f).suffix[1:] for f in traj.final_state.get('files', []) if Path(f).suffix},
-                    'patterns': traj.final_state.get('patterns', [])
-                }
-            )
-            
-            # Combined base score with weights
-            base_score = (
-                0.25 * bm25_score +      # Keyword matching
-                0.30 * embedding_sim +    # Semantic similarity
-                0.25 * state_sim +       # Repository state
-                0.20 * context_sim       # Technical context
-            )
-            
-            # Apply quality boosting
-            final_score = self._boost_by_quality(base_score, traj)
-            scored_trajectories.append((final_score, traj))
-        
-        # Sort by final score and return top results
-        scored_trajectories.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in scored_trajectories[:limit]]
+        # Combine pattern matches with standard retrieval
+        return pattern_trajectories + standard_matches
 
     def _compute_state_similarity(self,
                                 state1: Dict[str, Any],

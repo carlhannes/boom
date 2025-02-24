@@ -322,3 +322,254 @@ Tasks should be:
         # Sort by similarity and return top k
         similarities.sort(key=lambda x: x[0], reverse=True)
         return [traj for _, traj in similarities[:k]]
+
+    def chat_completion(self, messages: List[Dict[str, str]]) -> Any:
+        """
+        Execute a chat completion with enhanced context understanding and task planning
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+        """
+        # Add system context about code-specific understanding
+        base_context = {
+            "role": "system",
+            "content": (
+                "You are an expert coding agent specialized in understanding and "
+                "executing coding tasks in Git repositories. Consider:\n"
+                "1. Code patterns and best practices\n"
+                "2. Repository structure and state\n"
+                "3. Technical context and frameworks\n"
+                "4. Error handling and recovery\n"
+                "5. Testing and validation"
+            )
+        }
+        
+        # Ensure we preserve the system message if it exists
+        if messages and messages[0]["role"] == "system":
+            messages[0]["content"] = base_context["content"] + "\n\n" + messages[0]["content"]
+        else:
+            messages.insert(0, base_context)
+            
+        # Execute completion
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7,  # Balance between creativity and consistency
+            max_tokens=1000,  # Generous limit for complex responses
+            top_p=0.95,      # Focus on more likely tokens
+            presence_penalty=0.2,  # Slight penalty to avoid repetition
+            frequency_penalty=0.2   # Slight penalty for too-frequent tokens
+        )
+        
+        return response
+
+    def _analyze_task_context(self, task: str, repo_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze a task and repository state to extract relevant context for planning
+        """
+        # Prepare analysis prompt
+        analysis_prompt = f"""Analyze this coding task and repository state to extract relevant context:
+
+Task: {task}
+
+Repository State:
+{json.dumps(repo_state, indent=2)}
+
+Extract:
+1. Required file operations
+2. Dependencies and frameworks needed
+3. Potential error cases
+4. Testing requirements
+5. Success criteria
+6. Risk factors
+
+Return as JSON object."""
+
+        response = self.chat_completion([
+            {"role": "system", "content": "You are a technical analyst extracting structured context from coding tasks."},
+            {"role": "user", "content": analysis_prompt}
+        ])
+        
+        try:
+            return json.loads(response.choices[0].message.content)
+        except:
+            return {}
+
+    def _evaluate_action_risk(self, action: Dict[str, Any], context: Dict[str, Any]) -> float:
+        """
+        Evaluate the risk level of an action (0-1 scale)
+        """
+        risk_score = 0.0
+        
+        # Action type risks
+        type_risks = {
+            'edit_file': 0.4,      # Moderate risk - file changes
+            'git_commit': 0.2,     # Lower risk - reversible
+            'git_checkout': 0.6,   # Higher risk - branch changes
+            'run_tests': 0.1,      # Very low risk
+            'fix_permissions': 0.7, # High risk - system changes
+            'resolve_conflict': 0.8 # High risk - data loss possible
+        }
+        
+        risk_score += type_risks.get(action.get('type', ''), 0.5)
+        
+        # Content-based risks
+        if action.get('type') == 'edit_file':
+            # Check for sensitive operations
+            content = str(action.get('content', '')).lower()
+            if 'delete' in content or 'remove' in content:
+                risk_score += 0.2
+            if 'password' in content or 'secret' in content:
+                risk_score += 0.3
+                
+        # Context-based adjustments
+        if context.get('risk_factors'):
+            for factor in context['risk_factors']:
+                if isinstance(factor, dict) and factor.get('severity'):
+                    risk_score += float(factor['severity']) * 0.1
+                    
+        return min(1.0, risk_score)
+
+    def _validate_action(self, action: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        """
+        Validate an action against task context and constraints
+        """
+        # Basic action structure validation
+        if not isinstance(action, dict) or 'type' not in action:
+            return False
+            
+        # Action type-specific validation
+        if action['type'] == 'edit_file':
+            if not action.get('path') or not action.get('content'):
+                return False
+            # Validate against required operations
+            if context.get('required_operations'):
+                file_ops = [op.get('file') for op in context['required_operations']]
+                if action['path'] not in file_ops:
+                    return False
+                    
+        elif action['type'] == 'git_commit':
+            if not action.get('message'):
+                return False
+                
+        elif action['type'] == 'git_checkout':
+            if not action.get('branch'):
+                return False
+                
+        # Check risk level
+        risk_score = self._evaluate_action_risk(action, context)
+        if risk_score > 0.8:  # High-risk threshold
+            return False
+            
+        return True
+
+    def _get_pattern_suggestions(self, task: str, current_state: Dict[str, Any], examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Extract action suggestions from successful patterns in example trajectories
+        """
+        # Convert examples to sequences
+        sequences = []
+        for example in examples:
+            try:
+                sequence = ActionSequence.from_trajectory(example)
+                if sequence.success_rate > 0.8:
+                    sequences.append(sequence)
+            except:
+                continue
+        
+        # Group by semantic type
+        type_patterns = {}
+        for seq in sequences:
+            if seq.semantic_type not in type_patterns:
+                type_patterns[seq.semantic_type] = []
+            type_patterns[seq.semantic_type].append(seq)
+        
+        # Create pattern suggestions
+        suggestions = []
+        task_lower = task.lower()
+        
+        for sem_type, seqs in type_patterns.items():
+            if len(seqs) >= 2:  # Need multiple examples to form a pattern
+                pattern = SequencePattern(seqs)
+                best_example = pattern.get_best_example()
+                
+                # Check if pattern matches task semantics
+                matches_semantics = (
+                    (sem_type == 'create' and any(word in task_lower for word in ['create', 'add', 'new'])) or
+                    (sem_type == 'modify' and any(word in task_lower for word in ['update', 'change', 'modify'])) or
+                    (sem_type == 'test' and any(word in task_lower for word in ['test', 'verify'])) or
+                    (sem_type == 'fix' and any(word in task_lower for word in ['fix', 'repair', 'solve']))
+                )
+                
+                if matches_semantics:
+                    suggestions.append({
+                        'pattern_type': sem_type,
+                        'success_rate': pattern.avg_success_rate,
+                        'suggested_actions': [
+                            step.action for step in best_example.steps
+                        ],
+                        'example_instruction': best_example.steps[0].action.get('description', '')
+                    })
+        
+        return suggestions
+
+    def plan_next_action(self, current_state: Dict[str, Any], task: str, history: List[Dict[str, Any]], examples: List[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Plan the next action for a task using pattern matching and LLM guidance
+        """
+        # Get pattern suggestions if examples are provided
+        pattern_suggestions = []
+        if examples:
+            pattern_suggestions = self._get_pattern_suggestions(task, current_state, examples)
+        
+        # Analyze task context
+        context = self._analyze_task_context(task, current_state)
+        
+        # Prepare planning prompt with pattern information
+        planning_prompt = f"""Plan the next action for this coding task:
+
+Task: {task}
+
+Current State:
+{json.dumps(current_state, indent=2)}
+
+Action History:
+{json.dumps(history, indent=2)}
+
+Task Context:
+{json.dumps(context, indent=2)}
+
+Pattern Suggestions:
+{json.dumps(pattern_suggestions, indent=2)}
+
+Requirements:
+1. Action must be valid and safe
+2. Must make progress toward goal
+3. Consider successful patterns from similar tasks
+4. Handle potential errors
+5. Follow best practices
+
+Return a single action as JSON object with 'type' and required parameters."""
+
+        # Get action recommendation
+        response = self.chat_completion([
+            {"role": "system", "content": "You are a coding agent planning the next action in a sequence."},
+            {"role": "user", "content": planning_prompt}
+        ])
+        
+        try:
+            action = json.loads(response.choices[0].message.content)
+            
+            # Validate action before returning
+            if self._validate_action(action, context):
+                return action
+                
+        except:
+            # Fallback: Use most relevant pattern suggestion if available
+            if pattern_suggestions:
+                best_pattern = max(pattern_suggestions, key=lambda x: x['success_rate'])
+                current_step = len(history)
+                if current_step < len(best_pattern['suggested_actions']):
+                    return best_pattern['suggested_actions'][current_step]
+        
+        return None
