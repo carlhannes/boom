@@ -424,3 +424,194 @@ class CodingAgent:
                     'description': 'Following successful pattern'
                 }
             return None
+
+from typing import List, Dict, Any, Optional
+from ..environment.git_env import GitEnvironment
+from ..data.trajectory_manager import TrajectoryManager
+
+class Agent:
+    def __init__(self, env: GitEnvironment, trajectory_manager: TrajectoryManager):
+        self.env = env
+        self.trajectory_manager = trajectory_manager
+        self.current_trajectory: Optional[Dict[str, Any]] = None
+
+    def handle_error(self, error: str, state: Dict[str, Any]) -> bool:
+        """Handle an error using learned recovery patterns"""
+        # First try getting recovery actions from environment
+        recovery_actions = self.env._get_recovery_actions(error)
+        
+        if not recovery_actions:
+            # If no direct pattern, look for similar situations in trajectory history
+            similar_trajectories = self.trajectory_manager.retrieve_similar_trajectories(
+                current_state=state,
+                instruction=f"Fix {error}",
+                limit=3
+            )
+            
+            for trajectory in similar_trajectories:
+                # Look for successful error recovery in trajectory
+                for i, obs in enumerate(trajectory.observations):
+                    if isinstance(obs, dict) and obs.get('error') == error:
+                        # Found matching error, extract recovery actions
+                        recovery_idx = i + 1
+                        if recovery_idx < len(trajectory.actions):
+                            recovery_actions = trajectory.actions[recovery_idx:]
+                            break
+                if recovery_actions:
+                    break
+
+        if recovery_actions:
+            # Try the recovery actions
+            success = True
+            for action in recovery_actions:
+                result = self.execute_action(action)
+                if not isinstance(result, dict) or result.get('status') != 'success':
+                    success = False
+                    break
+            
+            # Update pattern success rate
+            self.env.add_recovery_pattern(error, recovery_actions, success)
+            
+            if success:
+                # Store successful recovery for future learning
+                self.trajectory_manager.store_error_recovery(
+                    error,
+                    type('Trajectory', (), {
+                        'instruction': f"Fix {error}",
+                        'actions': recovery_actions,
+                        'observations': [{'status': 'success'}],
+                        'final_state': self.env.get_state()
+                    })
+                )
+            
+            return success
+            
+        return False
+
+    def execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a single action and handle any errors"""
+        try:
+            # Record action in current trajectory
+            if self.current_trajectory:
+                self.current_trajectory['actions'].append(action)
+            
+            # Execute the action
+            result = self.env.execute(action)
+            
+            # Handle errors if needed
+            if isinstance(result, dict) and result.get('status') == 'error':
+                error = result.get('error', '')
+                if error and self.handle_error(error, self.env.get_state()):
+                    # Error was handled successfully, update result
+                    result = {'status': 'success'}
+            
+            # Record observation
+            if self.current_trajectory:
+                self.current_trajectory['observations'].append(result)
+            
+            return result
+            
+        except Exception as e:
+            # Unexpected errors also trigger recovery
+            if self.handle_error(str(e), self.env.get_state()):
+                return {'status': 'success'}
+            return {'status': 'error', 'error': str(e)}
+
+    def execute_task(self, instruction: str) -> Dict[str, Any]:
+        """Execute a task with error recovery and pattern learning"""
+        self.current_trajectory = {
+            'instruction': instruction,
+            'actions': [],
+            'observations': [],
+            'final_state': None
+        }
+        
+        try:
+            # Execute task actions
+            state = self.env.get_state()
+            
+            # Look for similar successful trajectories
+            similar = self.trajectory_manager.retrieve_similar_trajectories(
+                current_state=state,
+                instruction=instruction,
+                limit=1
+            )
+            
+            if similar:
+                # Found similar successful trajectory, try to replicate it
+                trajectory = similar[0]
+                for action in trajectory.actions:
+                    result = self.execute_action(action)
+                    if isinstance(result, dict) and result.get('status') != 'success':
+                        break
+            else:
+                # No similar trajectory, generate new plan
+                plan = self._generate_plan(instruction, state)
+                for action in plan:
+                    result = self.execute_action(action)
+                    if isinstance(result, dict) and result.get('status') != 'success':
+                        break
+            
+            # Record final state
+            final_state = self.env.get_state()
+            self.current_trajectory['final_state'] = final_state
+            
+            # Store trajectory if successful
+            if all(isinstance(obs, dict) and obs.get('status') == 'success' 
+                  for obs in self.current_trajectory['observations']):
+                self.trajectory_manager.store_trajectory(
+                    type('Trajectory', (), self.current_trajectory)()
+                )
+            
+            return {'status': 'success', 'state': final_state}
+            
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+        finally:
+            self.current_trajectory = None
+
+    def _generate_plan(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate a plan of actions based on instruction and current state"""
+        # First check for matching patterns in successful trajectories
+        similar = self.trajectory_manager.retrieve_similar_trajectories(
+            current_state=state,
+            instruction=instruction,
+            limit=5
+        )
+        
+        if similar:
+            # Analyze successful patterns to construct plan
+            pattern_actions = []
+            for trajectory in similar:
+                if all(isinstance(obs, dict) and obs.get('status') == 'success' 
+                      for obs in trajectory.observations):
+                    pattern_actions.extend(trajectory.actions)
+            
+            if pattern_actions:
+                # Group similar actions and keep most common sequence
+                action_sequences = []
+                current_sequence = []
+                
+                for action in pattern_actions:
+                    if not current_sequence:
+                        current_sequence.append(action)
+                    elif action['type'] == current_sequence[-1]['type']:
+                        current_sequence.append(action)
+                    else:
+                        action_sequences.append(current_sequence)
+                        current_sequence = [action]
+                
+                if current_sequence:
+                    action_sequences.append(current_sequence)
+                
+                # Take most common action from each sequence group
+                plan = []
+                for sequence in action_sequences:
+                    most_common = max(sequence, key=sequence.count)
+                    if most_common not in plan:  # Avoid duplicates
+                        plan.append(most_common)
+                
+                return plan
+        
+        # If no good patterns found, fallback to learner-generated plan
+        return self.learner.generate_plan(instruction, state)

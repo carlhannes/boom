@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 from rank_bm25 import BM25Okapi
 from ..core.learner import SelfLearner
+from .quality_metrics import QualityMetrics, QualityScore
+from .state_analyzer import StateChangeAnalyzer, StateChange
 
 class TrajectoryQualityMetrics:
     """Metrics for assessing trajectory quality"""
@@ -131,7 +133,10 @@ class TrajectoryManager:
         self.trajectories = []
         self.min_quality_threshold = 0.5  # Minimum quality score to keep trajectory
         self.rebuild_index()
-    
+        self.quality_metrics = QualityMetrics()
+        self.trajectory_scores: Dict[int, QualityScore] = {}
+        self.state_analyzer = StateChangeAnalyzer()
+
     def rebuild_index(self):
         """Build BM25 index from stored trajectories"""
         self.trajectories = self.load_trajectories()
@@ -156,33 +161,95 @@ class TrajectoryManager:
             
         self.bm25_index = BM25Okapi(tokenized_docs)
     
-    def store_trajectory(self, trajectory: Trajectory):
-        """Store a trajectory for later retrieval if it meets quality standards"""
-        # Compute quality metrics
-        metrics = trajectory.compute_quality_metrics()
-        
-        # Only store if quality meets threshold
-        if metrics.get_overall_score() >= self.min_quality_threshold:
-            # Create embedding for similarity matching
-            if trajectory._embedding is None:
-                trajectory._embedding = self.learner.compute_embedding(
-                    trajectory.instruction
+    def store_trajectory(self, trajectory: Trajectory) -> bool:
+        """Store trajectory with state change analysis"""
+        # Analyze state changes
+        changes = []
+        for i in range(len(trajectory.observations) - 1):
+            state_before = trajectory.observations[i].get('state_before', {})
+            state_after = trajectory.observations[i + 1].get('state_after', {})
+            
+            if state_before and state_after:
+                changes.extend(
+                    self.state_analyzer.analyze_change(state_before, state_after)
                 )
-                
-            # Store trajectory data with embedding and quality metrics
-            data = trajectory.to_dict()
-            data['embedding'] = trajectory._embedding.tolist()
+        
+        # Compute quality with state change impact
+        score = self.quality_metrics.compute_trajectory_quality(
+            trajectory,
+            trajectory.instruction
+        )
+        
+        # Adjust quality score based on state changes
+        if changes:
+            avg_impact = sum(c.impact for c in changes) / len(changes)
+            adjusted_score = QualityScore(
+                success_rate=score.success_rate,
+                consistency=score.consistency,
+                efficiency=score.efficiency * (1 - 0.2 * avg_impact),  # Penalize high-impact changes
+                relevance=score.relevance,
+                safety=score.safety * (1 - 0.3 * avg_impact)  # Reduce safety score for high-impact changes
+            )
+        else:
+            adjusted_score = score
+        
+        # Check if trajectory should be stored
+        if self.quality_metrics.should_filter_trajectory(adjusted_score):
+            return False
             
-            # Use a hash of instruction + timestamp as filename
-            filename = f"{hash(trajectory.instruction)}_{int(time.time())}.json"
-            filepath = self.storage_path / filename
+        # Update patterns with state changes
+        self.state_analyzer._update_patterns(changes)
+        
+        # Store trajectory with enhanced metadata
+        trajectory_id = len(self.trajectories)
+        self.trajectories.append(trajectory)
+        self.trajectory_scores[trajectory_id] = adjusted_score
+        
+        # Store state changes for future reference
+        if not hasattr(trajectory, 'state_changes'):
+            trajectory.state_changes = changes
+        
+        # Rebuild index if needed
+        if self.bm25_index is not None:
+            self.rebuild_index()
             
-            with filepath.open('w') as f:
-                json.dump(data, f, indent=2)
-                
-            # Rebuild index to include new trajectory
+        return True
+
+    def maintain_quality(self, min_score: float = 0.7) -> int:
+        """
+        Maintain trajectory library quality by removing low-quality examples
+        Returns number of trajectories removed
+        """
+        initial_count = len(self.trajectories)
+        
+        # Re-score all trajectories
+        self.trajectory_scores = {}
+        high_quality_trajectories = []
+        
+        for trajectory in self.trajectories:
+            score = self.quality_metrics.compute_trajectory_quality(
+                trajectory,
+                trajectory.instruction
+            )
+            
+            if score.total_score >= min_score:
+                trajectory_id = len(high_quality_trajectories)
+                high_quality_trajectories.append(trajectory)
+                self.trajectory_scores[trajectory_id] = score
+        
+        # Update trajectory list
+        self.trajectories = high_quality_trajectories
+        
+        # Rebuild index after filtering
+        if self.bm25_index is not None:
             self.rebuild_index()
         
+        return initial_count - len(self.trajectories)
+
+    def get_trajectory_quality(self, trajectory_id: int) -> Optional[QualityScore]:
+        """Get quality score for a trajectory"""
+        return self.trajectory_scores.get(trajectory_id)
+
     def load_trajectories(self) -> List[Trajectory]:
         """Load all stored trajectories"""
         trajectories = []
@@ -330,99 +397,214 @@ class TrajectoryManager:
                                    limit: int = 5,
                                    bm25_top_k: int = 50) -> List[Trajectory]:
         """
-        Enhanced retrieval with pattern matching and context awareness
+        Enhanced retrieval with agentic state matching and context awareness
         """
         if not self.trajectories:
             return []
+            
+        # First get candidates using text similarity
+        query_tokens = simple_tokenize(instruction)
+        if not self.bm25_index:
+            self.rebuild_index()
+            
+        bm25_scores = self.bm25_index.get_scores(query_tokens)
+        max_score = max(bm25_scores) if any(bm25_scores) else 1.0
+        top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
         
-        # Stage 1: Pattern-based matching
-        pattern_matches = self._find_matching_patterns(instruction, current_state)
+        scored_candidates = []
         
-        # Convert pattern matches back to trajectories
-        pattern_trajectories = []
-        for sequence in pattern_matches:
-            # Find the original trajectory this sequence came from
-            for traj in self.trajectories:
-                if all(
-                    action == step.action
-                    for action, step in zip(traj.actions, sequence.steps)
-                ):
-                    pattern_trajectories.append(traj)
+        for idx in top_k_indices:
+            traj = self.trajectories[idx]
+            
+            # Calculate different similarity components
+            bm25_score = bm25_scores[idx] / max_score
+            
+            # Compute state similarity score
+            state_sim = self._compute_state_similarity(
+                current_state,
+                traj.final_state
+            )
+            
+            # Get environment context match
+            context_sim = self._compute_context_match(
+                current_state,
+                traj.final_state
+            )
+            
+            # Calculate action applicability score
+            action_score = self._compute_action_applicability(
+                current_state,
+                traj.actions
+            )
+            
+            # Calculate semantic similarity if embeddings available
+            semantic_sim = 0.0
+            if hasattr(traj, '_embedding') and traj._embedding is not None:
+                query_embedding = self.learner.compute_embedding(instruction)
+                semantic_sim = np.dot(query_embedding, traj._embedding)
+            
+            # Combine scores with learned weights
+            final_score = (
+                0.3 * bm25_score +        # Text similarity
+                0.2 * state_sim +         # State matching
+                0.2 * context_sim +       # Environment context
+                0.2 * action_score +      # Action applicability
+                0.1 * semantic_sim        # Semantic similarity
+            )
+            
+            scored_candidates.append((final_score, traj))
+        
+        # Sort by final score and return top trajectories
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in scored_candidates[:limit]]
+
+    def retrieve_similar_trajectories(self,
+                                   current_state: Dict[str, Any],
+                                   instruction: str,
+                                   limit: int = 5,
+                                   min_quality: float = 0.7) -> List['Trajectory']:
+        """Enhanced retrieval with state change pattern matching"""
+        base_candidates = super().retrieve_similar_trajectories(
+            current_state,
+            instruction,
+            limit=limit * 2
+        )
+        
+        # Get current changes if available
+        current_changes = []
+        if hasattr(current_state, 'previous_state'):
+            current_changes = self.state_analyzer.analyze_change(
+                current_state.previous_state,
+                current_state
+            )
+        
+        # Score candidates with state pattern matching
+        scored_candidates = []
+        for trajectory in base_candidates:
+            # Get trajectory's state changes
+            trajectory_changes = getattr(trajectory, 'state_changes', [])
+            
+            # Calculate state pattern similarity if we have current changes
+            state_similarity = 0.0
+            if current_changes and trajectory_changes:
+                similar_patterns = self.state_analyzer.get_similar_changes(
+                    current_changes,
+                    threshold=0.6
+                )
+                if similar_patterns:
+                    max_similarity = max(
+                        self._calculate_change_similarity(current_changes, pattern)
+                        for pattern in similar_patterns
+                    )
+                    state_similarity = max_similarity
+            
+            # Get base quality score
+            quality_score = self.get_trajectory_quality(
+                self.trajectories.index(trajectory)
+            )
+            
+            if quality_score and quality_score.total_score >= min_quality:
+                # Combine quality score with state similarity
+                final_score = quality_score.total_score * (1 + 0.5 * state_similarity)
+                scored_candidates.append((final_score, trajectory))
+        
+        # Sort by final score and return top results
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in scored_candidates[:limit]]
+
+    def _calculate_change_similarity(self,
+                                  changes1: List[StateChange],
+                                  changes2: List[StateChange]) -> float:
+        """Calculate similarity between two sets of state changes"""
+        if not changes1 or not changes2:
+            return 0.0
+            
+        # Compare change types and impacts
+        matches = 0
+        total = max(len(changes1), len(changes2))
+        
+        for c1 in changes1:
+            for c2 in changes2:
+                if (c1.type == c2.type and
+                    abs(c1.impact - c2.impact) < 0.3 and
+                    (c1.path == c2.path or
+                     Path(c1.path).suffix == Path(c2.path).suffix)):
+                    matches += 1
                     break
         
-        # Stage 2: Standard retrieval for remaining slots
-        remaining_slots = max(0, limit - len(pattern_trajectories))
-        if remaining_slots > 0:
-            query_tokens = simple_tokenize(instruction)
-            if not self.bm25_index:
-                self.rebuild_index()
-                
-            bm25_scores = self.bm25_index.get_scores(query_tokens)
-            max_score = max(bm25_scores) if any(bm25_scores) else 1.0
-            top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
+        return matches / total
+
+    def _compute_context_match(self,
+                             current_state: Dict[str, Any],
+                             trajectory_state: Dict[str, Any]) -> float:
+        """
+        Compute similarity between technical contexts and repository states
+        Considers frameworks, languages, and patterns
+        """
+        if not current_state or not trajectory_state:
+            return 0.0
             
-            # Extract technical context
-            query_context = {
-                'frameworks': current_state.get('frameworks', []),
-                'languages': current_state.get('languages', []),
-                'file_types': {Path(f).suffix[1:] for f in current_state.get('files', []) if Path(f).suffix},
-                'patterns': current_state.get('patterns', [])
-            }
+        score = 0.0
+        total_weight = 0.0
+        
+        # Compare frameworks
+        frameworks1 = set(current_state.get('frameworks', []))
+        frameworks2 = set(trajectory_state.get('frameworks', []))
+        if frameworks1 or frameworks2:
+            score += 0.3 * len(frameworks1 & frameworks2) / max(len(frameworks1 | frameworks2), 1)
+            total_weight += 0.3
             
-            if not self.should_apply_rerank(bm25_scores, instruction):
-                # BM25-only with quality boosting
-                scored_trajectories = [
-                    (self._boost_by_quality(bm25_scores[i] / max_score, self.trajectories[i]), self.trajectories[i])
-                    for i in top_k_indices
-                    if self.trajectories[i] not in pattern_trajectories
-                ]
-                scored_trajectories.sort(key=lambda x: x[0], reverse=True)
-                standard_matches = [t for _, t in scored_trajectories[:remaining_slots]]
+        # Compare languages
+        langs1 = set(current_state.get('languages', []))
+        langs2 = set(trajectory_state.get('languages', []))
+        if langs1 or langs2:
+            score += 0.3 * len(langs1 & langs2) / max(len(langs1 | langs2), 1)
+            total_weight += 0.3
+            
+        # Compare file patterns
+        patterns1 = set(current_state.get('patterns', []))
+        patterns2 = set(trajectory_state.get('patterns', []))
+        if patterns1 or patterns2:
+            score += 0.2 * len(patterns1 & patterns2) / max(len(patterns1 | patterns2), 1)
+            total_weight += 0.2
+            
+        # Compare directory structure patterns
+        dirs1 = set(str(Path(f).parent) for f in current_state.get('files', []))
+        dirs2 = set(str(Path(f).parent) for f in trajectory_state.get('files', []))
+        if dirs1 or dirs2:
+            score += 0.2 * len(dirs1 & dirs2) / max(len(dirs1 | dirs2), 1)
+            total_weight += 0.2
+            
+        return score / total_weight if total_weight > 0 else 0.0
+
+    def _compute_action_applicability(self,
+                                   current_state: Dict[str, Any],
+                                   actions: List[Dict[str, Any]]) -> float:
+        """
+        Compute how applicable a trajectory's actions are to current state
+        """
+        if not actions:
+            return 0.0
+            
+        applicable_count = 0
+        current_files = set(current_state.get('files', []))
+        
+        for action in actions:
+            action_type = action.get('type', '')
+            target_file = action.get('file')
+            
+            if action_type in ['create_file', 'add_file']:
+                # Creating new files is always applicable
+                applicable_count += 1
+            elif target_file:
+                # Check if target file exists for file operations
+                if target_file in current_files:
+                    applicable_count += 1
             else:
-                # Enhanced reranking
-                query_embedding = self.learner.compute_embedding(instruction)
-                scored_trajectories = []
+                # General actions without file targets are considered applicable
+                applicable_count += 1
                 
-                for idx in top_k_indices:
-                    traj = self.trajectories[idx]
-                    
-                    # Skip if already in pattern matches
-                    if traj in pattern_trajectories:
-                        continue
-                    
-                    # Calculate scores
-                    bm25_score = bm25_scores[idx] / max_score
-                    
-                    if not hasattr(traj, '_embedding') or traj._embedding is None:
-                        traj._embedding = self.learner.compute_embedding(traj.instruction)
-                    embedding_sim = np.dot(query_embedding, traj._embedding)
-                    
-                    state_sim = self._compute_state_similarity(current_state, traj.final_state)
-                    context_sim = self._compute_context_similarity(
-                        query_context,
-                        {
-                            'frameworks': traj.final_state.get('frameworks', []),
-                            'languages': traj.final_state.get('languages', []),
-                            'file_types': {Path(f).suffix[1:] for f in traj.final_state.get('files', []) if Path(f).suffix},
-                            'patterns': traj.final_state.get('patterns', [])
-                        }
-                    )
-                    
-                    base_score = (
-                        0.25 * bm25_score +
-                        0.30 * embedding_sim +
-                        0.25 * state_sim +
-                        0.20 * context_sim
-                    )
-                    
-                    final_score = self._boost_by_quality(base_score, traj)
-                    scored_trajectories.append((final_score, traj))
-                
-                scored_trajectories.sort(key=lambda x: x[0], reverse=True)
-                standard_matches = [t for _, t in scored_trajectories[:remaining_slots]]
-            
-        # Combine pattern matches with standard retrieval
-        return pattern_trajectories + standard_matches
+        return applicable_count / len(actions)
 
     def _compute_state_similarity(self,
                                 state1: Dict[str, Any],
@@ -451,3 +633,54 @@ class TrajectoryManager:
                 score += 0.1 * overlap
                 
         return score
+
+    def extract_error_patterns(self) -> Dict[str, List[ActionSequence]]:
+        """Extract successful error recovery patterns from trajectories"""
+        error_patterns = {}
+        
+        for trajectory in self.trajectories:
+            # Look for error recovery sequences
+            for i, obs in enumerate(trajectory.observations):
+                if isinstance(obs, dict) and 'error' in obs:
+                    error_type = obs.get('error', '')
+                    if not error_type:
+                        continue
+                        
+                    # Look for successful recovery in subsequent actions
+                    if i + 1 < len(trajectory.observations):
+                        recovery_actions = trajectory.actions[i+1:]
+                        recovery_obs = trajectory.observations[i+1:]
+                        
+                        # Check if recovery was successful
+                        if any(isinstance(o, dict) and o.get('status') == 'success' 
+                              for o in recovery_obs):
+                            # Create sequence from recovery actions
+                            sequence = ActionSequence.from_trajectory(
+                                trajectory.__class__(
+                                    instruction=f"Fix {error_type}",
+                                    actions=recovery_actions,
+                                    observations=recovery_obs,
+                                    final_state=trajectory.final_state
+                                )
+                            )
+                            
+                            if error_type not in error_patterns:
+                                error_patterns[error_type] = []
+                            error_patterns[error_type].append(sequence)
+        
+        return error_patterns
+    
+    def update_environment_patterns(self, git_env: 'GitEnvironment') -> None:
+        """Update GitEnvironment with learned error recovery patterns"""
+        error_patterns = self.extract_error_patterns()
+        
+        for error_type, sequences in error_patterns.items():
+            for sequence in sequences:
+                # Convert sequence back to actions
+                actions = [step.action for step in sequence.steps]
+                git_env.add_recovery_pattern(error_type, actions, True)
+
+    def store_error_recovery(self, error: str, recovery_trajectory: 'Trajectory') -> None:
+        """Store a successful error recovery trajectory"""
+        if recovery_trajectory.compute_quality_metrics().success_rate >= 0.8:
+            self.store_trajectory(recovery_trajectory)

@@ -1,73 +1,84 @@
-# AI Agent
+# AI Agent with Learn-by-interact
 
-AI coding agent based on Learn-by-interact principles.
+An AI coding agent that implements Learn-by-interact principles for autonomous learning and task execution in software development environments.
+
+## Features
+
+- **Autonomous Learning**: Learns from documentation, codebase patterns, and successful interactions
+- **Quality-Driven**: Automatically filters and maintains high-quality action patterns
+- **State-Aware Matching**: Uses repository state and context for better action selection
+- **Pattern-Based Recovery**: Learns from successful error recovery patterns
+- **Continuous Improvement**: Refines instructions through backward construction
 
 ## Installation
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd ai-agent
-```
-
-2. Create a virtual environment:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
-```
-
-3. Install dependencies:
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
-## ARM64 (Apple Silicon) Users
+## Usage
 
-For ARM64 architectures (e.g., Apple Silicon Macs), if you encounter any issues with scipy installation, pre-compiled wheels are available in the `wheels` directory. These can be installed with:
+### Learning from a Repository
 
 ```bash
-pip install wheels/numpy-2.2.3-cp312-cp312-macosx_14_0_arm64.whl
-pip install wheels/scipy-1.13.1-cp312-cp312-macosx_12_0_arm64.whl
+ai-agent learn /path/to/repo --docs-path /path/to/docs
 ```
 
-## Development
+### Executing Tasks
 
-1. Setup development environment:
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
-pip install -r requirements.txt
+ai-agent execute /path/to/repo "Add unit tests for the user module"
 ```
 
-2. Run tests:
+To see planned actions without executing:
 ```bash
-pytest
+ai-agent execute /path/to/repo "Refactor authentication logic" --dry-run
 ```
 
-3. Format code:
+### Analyzing a Repository
+
 ```bash
-black .
-isort .
+ai-agent analyze /path/to/repo
 ```
 
-## Getting Started
+### Viewing Status
 
-See the `examples/demo.py` file for example usage of the agent.
+```bash
+ai-agent status /path/to/repo
+```
 
-## Project Structure
+## How it Works
 
-- `ai_agent/core/` - Core agent and learning components
-- `ai_agent/environment/` - Git repository interface
-- `ai_agent/data/` - Trajectory storage and management
-- `docs/` - Additional documentation
-- `examples/` - Usage examples
-- `tests/` - Test suite
+1. **Task Generation**
+   - Extracts tasks from documentation
+   - Analyzes codebase patterns
+   - Generates framework-specific tasks
 
-## Documentation
+2. **Pattern Learning**
+   - Records successful action sequences
+   - Builds pattern library from high-quality executions
+   - Learns state transitions and context patterns
 
-- [Architecture Overview](docs/architecture.md)
-- [Usage Guide](docs/usage.md)
+3. **Quality Assessment**
+   - Evaluates trajectory success rate
+   - Measures action efficiency and relevance
+   - Filters low-quality patterns automatically
+
+4. **Agentic Retrieval**
+   - Matches current state with successful patterns
+   - Uses context-aware similarity scoring
+   - Adapts to repository-specific patterns
+
+5. **Error Recovery**
+   - Learns from successful recovery patterns
+   - Builds pattern-based recovery strategies
+   - Maintains safety through quality filtering
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## License
 
-See [LICENSE](LICENSE) file.
+MIT License - see LICENSE file for details

@@ -3,6 +3,8 @@ import numpy as np
 from pathlib import Path
 from ai_agent.data.trajectory_manager import TrajectoryManager, Trajectory
 from ai_agent.data.sequence import ActionSequence, SequencePattern
+from ai_agent.environment.git_env import GitEnvironment
+from ai_agent.data.quality_metrics import QualityScore
 
 class MockLearner:
     def compute_embedding(self, text: str) -> np.ndarray:
@@ -238,3 +240,188 @@ def test_pattern_priority(trajectory_manager_with_data):
     first_sequence = ActionSequence.from_trajectory(trajectories[0])
     assert 'test' in first_sequence.semantic_type.lower()
     assert first_sequence.success_rate > 0.8
+
+def create_test_trajectory(instruction: str, actions: list, observations: list, final_state: dict):
+    """Helper to create test trajectories"""
+    return type('Trajectory', (), {
+        'instruction': instruction,
+        'actions': actions,
+        'observations': observations,
+        'final_state': final_state,
+        'compute_quality_metrics': lambda self: type('Metrics', (), {'success_rate': 1.0})()
+    })
+
+def test_error_pattern_extraction():
+    tm = TrajectoryManager("test_storage")
+    
+    # Create a test trajectory with error and recovery
+    trajectory = create_test_trajectory(
+        instruction="Add a new feature",
+        actions=[
+            {'type': 'edit_file', 'file': 'test.py'},
+            {'type': 'run_tests'},  # Causes error
+            {'type': 'fix_imports'},  # Recovery action
+            {'type': 'run_tests'}  # Success
+        ],
+        observations=[
+            {'status': 'success'},
+            {'status': 'error', 'error': 'ImportError'},
+            {'status': 'success'},
+            {'status': 'success'}
+        ],
+        final_state={'files': ['test.py']}
+    )
+    
+    # Store trajectory and extract patterns
+    tm.store_trajectory(trajectory)
+    patterns = tm.extract_error_patterns()
+    
+    assert 'ImportError' in patterns
+    assert len(patterns['ImportError']) == 1
+    
+    # Verify recovery sequence
+    recovery_seq = patterns['ImportError'][0]
+    assert isinstance(recovery_seq, ActionSequence)
+    assert len(recovery_seq.steps) == 2  # fix_imports + run_tests
+
+def test_environment_pattern_integration(tmp_path):
+    tm = TrajectoryManager("test_storage")
+    env = GitEnvironment(str(tmp_path))
+    
+    # Create and store a trajectory with successful error recovery
+    trajectory = create_test_trajectory(
+        instruction="Fix merge conflict",
+        actions=[
+            {'type': 'merge'},
+            {'type': 'resolve_conflict', 'file': 'test.py'},
+            {'type': 'commit'}
+        ],
+        observations=[
+            {'status': 'error', 'error': 'MergeConflict'},
+            {'status': 'success'},
+            {'status': 'success'}
+        ],
+        final_state={'branch': 'main'}
+    )
+    
+    tm.store_trajectory(trajectory)
+    
+    # Update environment patterns
+    tm.update_environment_patterns(env)
+    
+    # Verify pattern was transferred to environment
+    assert 'MergeConflict' in env.error_patterns
+    pattern = env.error_patterns['MergeConflict'][0]
+    assert pattern.success_rate > 0
+
+def test_quality_filtered_storage():
+    tm = TrajectoryManager("test_storage")
+    
+    # Try storing a high-quality trajectory
+    good_trajectory = create_test_trajectory(
+        "Add tests",
+        [
+            {'type': 'create_file', 'file': 'test.py'},
+            {'type': 'write_test', 'file': 'test.py'},
+            {'type': 'run_tests'}
+        ],
+        [
+            {'status': 'success'},
+            {'status': 'success'},
+            {'status': 'success'}
+        ]
+    )
+    
+    stored = tm.store_trajectory(good_trajectory)
+    assert stored  # Should store high-quality trajectory
+    assert len(tm.trajectories) == 1
+    
+    # Try storing a low-quality trajectory
+    bad_trajectory = create_test_trajectory(
+        "Delete files",
+        [
+            {'type': 'delete_file', 'file': '*'},
+            {'type': 'delete_file', 'file': '*'}
+        ],
+        [
+            {'status': 'error'},
+            {'status': 'error'}
+        ],
+        success_rate=0.0
+    )
+    
+    stored = tm.store_trajectory(bad_trajectory)
+    assert not stored  # Should reject low-quality trajectory
+    assert len(tm.trajectories) == 1
+
+def test_quality_maintenance():
+    tm = TrajectoryManager("test_storage")
+    
+    # Add mix of high and low quality trajectories
+    trajectories = [
+        create_test_trajectory(
+            "Good example",
+            [{'type': 'good_action'}],
+            [{'status': 'success'}],
+            success_rate=1.0
+        ),
+        create_test_trajectory(
+            "Bad example",
+            [{'type': 'bad_action'}],
+            [{'status': 'error'}],
+            success_rate=0.2
+        ),
+        create_test_trajectory(
+            "Another good example",
+            [{'type': 'good_action'}],
+            [{'status': 'success'}],
+            success_rate=0.9
+        )
+    ]
+    
+    for t in trajectories:
+        tm.store_trajectory(t)
+    
+    # Run quality maintenance
+    removed = tm.maintain_quality(min_score=0.7)
+    
+    assert removed == 1  # Should remove one low-quality trajectory
+    assert len(tm.trajectories) == 2  # Should keep two good trajectories
+
+def test_quality_filtered_retrieval():
+    tm = TrajectoryManager("test_storage")
+    
+    # Add trajectories with varying quality
+    trajectories = [
+        create_test_trajectory(
+            "High quality example",
+            [{'type': 'good_action', 'file': 'test.py'}],
+            [{'status': 'success'}],
+            success_rate=1.0
+        ),
+        create_test_trajectory(
+            "Medium quality example",
+            [{'type': 'ok_action', 'file': 'test.py'}],
+            [{'status': 'success'}, {'status': 'error'}],
+            success_rate=0.5
+        ),
+        create_test_trajectory(
+            "Another high quality example",
+            [{'type': 'good_action', 'file': 'other.py'}],
+            [{'status': 'success'}],
+            success_rate=0.9
+        )
+    ]
+    
+    for t in trajectories:
+        tm.store_trajectory(t)
+    
+    # Test quality-filtered retrieval
+    similar = tm.retrieve_similar_trajectories(
+        current_state={'files': ['test.py']},
+        instruction="Run good action",
+        min_quality=0.7
+    )
+    
+    assert len(similar) == 2  # Should only return high-quality matches
+    assert all(t.compute_quality_metrics().success_rate >= 0.7 for t in similar)

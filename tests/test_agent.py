@@ -292,3 +292,222 @@ def test_bm25_score_threshold(mock_repo, mock_storage, mock_learner):
     assert isinstance(trajectory, Trajectory)
     # Verify actions match the exact match trajectory
     assert trajectory.actions[0]["path"] == "login.py"
+
+import pytest
+from pathlib import Path
+from ai_agent.environment.git_env import GitEnvironment
+from ai_agent.data.sequence import ActionSequence, ActionStep
+
+def test_error_pattern_learning(tmp_path: Path):
+    # Setup a test repo
+    repo_path = tmp_path / "test_repo"
+    repo_path.mkdir()
+    env = GitEnvironment(str(repo_path))
+    
+    # Test error recovery pattern learning
+    error = "MergeConflictError"
+    actions = [
+        {'type': 'resolve_conflict', 'file': 'test.py'},
+        {'type': 'stage_file', 'file': 'test.py'},
+        {'type': 'commit', 'message': 'Fix merge conflict'}
+    ]
+    
+    # Add pattern and verify it's stored
+    env.add_recovery_pattern(error, actions, True)
+    assert error in env.error_patterns
+    assert len(env.error_patterns[error]) == 1
+    
+    # Verify pattern success rate tracking
+    pattern = env.error_patterns[error][0]
+    assert pattern.success_rate == 1.0
+    
+    # Add another instance of same pattern
+    env.add_recovery_pattern(error, actions, False)
+    assert len(env.error_patterns[error]) == 1  # Should update existing pattern
+    assert pattern.success_rate == 0.5  # Now 1 success out of 2 attempts
+
+def test_recovery_action_retrieval(tmp_path: Path):
+    repo_path = tmp_path / "test_repo"
+    repo_path.mkdir()
+    env = GitEnvironment(str(repo_path))
+    
+    # Add some patterns with different success rates
+    error = "PackageNotFoundError"
+    good_actions = [
+        {'type': 'install_package', 'name': 'missing-pkg'},
+        {'type': 'update_requirements', 'file': 'requirements.txt'}
+    ]
+    bad_actions = [
+        {'type': 'install_package', 'name': 'wrong-pkg'}
+    ]
+    
+    # Add patterns with different success rates
+    env.add_recovery_pattern(error, good_actions, True)
+    env.add_recovery_pattern(error, good_actions, True)
+    env.add_recovery_pattern(error, bad_actions, False)
+    
+    # Should get the more successful pattern
+    recovery_actions = env._get_recovery_actions(error)
+    assert recovery_actions == good_actions
+
+import pytest
+from unittest.mock import Mock, patch
+from ai_agent.core.agent import Agent
+from ai_agent.environment.git_env import GitEnvironment
+from ai_agent.data.trajectory_manager import TrajectoryManager
+
+def test_error_recovery_from_patterns(tmp_path):
+    # Setup mocked environment and trajectory manager
+    env = GitEnvironment(str(tmp_path))
+    tm = Mock(spec=TrajectoryManager)
+    agent = Agent(env, tm)
+    
+    # Setup test error pattern
+    error_type = "TestError"
+    recovery_actions = [
+        {'type': 'fix_test', 'file': 'test.py'},
+        {'type': 'run_tests'}
+    ]
+    
+    # Mock environment to return error then success
+    env.execute = Mock(side_effect=[
+        {'status': 'error', 'error': error_type},
+        {'status': 'success'},
+        {'status': 'success'}
+    ])
+    env._get_recovery_actions = Mock(return_value=recovery_actions)
+    
+    # Execute action that will trigger error recovery
+    result = agent.execute_action({'type': 'run_tests'})
+    
+    # Verify error was handled successfully
+    assert result['status'] == 'success'
+    assert env.execute.call_count == 3  # Original + 2 recovery actions
+
+def test_error_recovery_from_trajectories(tmp_path):
+    env = GitEnvironment(str(tmp_path))
+    tm = Mock(spec=TrajectoryManager)
+    agent = Agent(env, tm)
+    
+    # Setup mock trajectory with successful error recovery
+    tm.retrieve_similar_trajectories.return_value = [
+        type('Trajectory', (), {
+            'observations': [
+                {'status': 'error', 'error': 'ImportError'},
+                {'status': 'success'}
+            ],
+            'actions': [
+                {'type': 'fix_imports'}
+            ]
+        })()
+    ]
+    
+    # Mock environment to fail then succeed after recovery
+    env.execute = Mock(side_effect=[
+        {'status': 'error', 'error': 'ImportError'},
+        {'status': 'success'}
+    ])
+    env._get_recovery_actions = Mock(return_value=None)  # Force trajectory lookup
+    
+    # Execute action
+    result = agent.execute_action({'type': 'run_code'})
+    
+    # Verify recovery from trajectory worked
+    assert result['status'] == 'success'
+    assert tm.retrieve_similar_trajectories.called
+    assert env.execute.call_count == 2
+
+def test_task_execution_with_similar_trajectory(tmp_path):
+    env = GitEnvironment(str(tmp_path))
+    tm = Mock(spec=TrajectoryManager)
+    agent = Agent(env, tm)
+    
+    # Setup successful similar trajectory
+    similar_trajectory = type('Trajectory', (), {
+        'actions': [
+            {'type': 'create_file', 'file': 'new.py'},
+            {'type': 'write_code', 'file': 'new.py'}
+        ],
+        'observations': [
+            {'status': 'success'},
+            {'status': 'success'}
+        ]
+    })()
+    tm.retrieve_similar_trajectories.return_value = [similar_trajectory]
+    
+    # Mock successful execution
+    env.execute = Mock(return_value={'status': 'success'})
+    
+    # Execute task
+    result = agent.execute_task("Create a new Python file")
+    
+    # Verify task used similar trajectory
+    assert result['status'] == 'success'
+    assert env.execute.call_count == 2  # Both actions from similar trajectory
+    assert tm.retrieve_similar_trajectories.called
+
+def test_plan_generation_from_patterns(tmp_path):
+    env = GitEnvironment(str(tmp_path))
+    tm = Mock(spec=TrajectoryManager)
+    agent = Agent(env, tm)
+    
+    # Setup several similar trajectories with different variations
+    similar_trajectories = [
+        type('Trajectory', (), {
+            'actions': [
+                {'type': 'create_file', 'file': 'test1.py'},
+                {'type': 'write_test', 'file': 'test1.py'},
+                {'type': 'run_tests'}
+            ],
+            'observations': [
+                {'status': 'success'},
+                {'status': 'success'},
+                {'status': 'success'}
+            ]
+        })(),
+        type('Trajectory', (), {
+            'actions': [
+                {'type': 'create_file', 'file': 'test2.py'},
+                {'type': 'write_test', 'file': 'test2.py'},
+                {'type': 'run_tests'}
+            ],
+            'observations': [
+                {'status': 'success'},
+                {'status': 'success'},
+                {'status': 'success'}
+            ]
+        })()
+    ]
+    
+    tm.retrieve_similar_trajectories.return_value = similar_trajectories
+    
+    # Generate plan
+    state = {'files': ['src/main.py']}
+    plan = agent._generate_plan("Add unit tests", state)
+    
+    # Verify plan extracts common pattern
+    assert len(plan) == 3
+    assert plan[0]['type'] == 'create_file'
+    assert plan[1]['type'] == 'write_test'
+    assert plan[2]['type'] == 'run_tests'
+
+def test_plan_generation_fallback(tmp_path):
+    env = GitEnvironment(str(tmp_path))
+    tm = Mock(spec=TrajectoryManager)
+    agent = Agent(env, tm)
+    
+    # Mock no similar trajectories found
+    tm.retrieve_similar_trajectories.return_value = []
+    
+    # Mock learner plan generation
+    mock_plan = [{'type': 'analyze_code'}, {'type': 'suggest_changes'}]
+    agent.learner = Mock()
+    agent.learner.generate_plan.return_value = mock_plan
+    
+    # Generate plan
+    state = {'files': ['src/main.py']}
+    plan = agent._generate_plan("Improve code quality", state)
+    
+    # Verify fallback to learner
+    assert plan == mock_plan
+    assert agent.learner.generate_plan.called

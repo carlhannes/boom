@@ -1,170 +1,155 @@
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Sequence
 import numpy as np
+from collections import defaultdict
 
 @dataclass
 class ActionStep:
     """Represents a single step in an action sequence"""
     action: Dict[str, Any]
-    observation: Dict[str, Any]
     state_before: Dict[str, Any]
     state_after: Dict[str, Any]
     success: bool
+    error: Optional[str] = None
 
-@dataclass
 class ActionSequence:
-    """Represents a sequence of actions with their outcomes"""
-    steps: List[ActionStep]
-    success_rate: float
-    complexity: float
-    semantic_type: str  # e.g., 'create', 'modify', 'test', etc.
-    
+    """Represents a sequence of actions with their states and outcomes"""
+    def __init__(self, steps: List[ActionStep], semantic_type: str):
+        self.steps = steps
+        self.semantic_type = semantic_type
+        self._success_rate = self._calculate_success_rate()
+
     @classmethod
     def from_trajectory(cls, trajectory: 'Trajectory') -> 'ActionSequence':
-        """Create an ActionSequence from a Trajectory"""
+        """Create an action sequence from a trajectory"""
         steps = []
-        current_state = trajectory.final_state
+        states = [trajectory.final_state]  # Start with final state
         
-        # Build steps in reverse order to track states
+        # Work backwards through actions and observations
         for action, obs in zip(reversed(trajectory.actions), reversed(trajectory.observations)):
-            step = ActionStep(
-                action=action,
-                observation=obs,
-                state_after=current_state.copy(),
-                state_before={},  # Will be filled in next iteration
-                success=isinstance(obs, dict) and obs.get('status') == 'success'
-            )
-            steps.insert(0, step)
-            current_state = obs.get('state', {})
-            if len(steps) > 1:
-                steps[1].state_before = current_state.copy()
-        
-        if steps:
-            steps[0].state_before = current_state
-        
-        # Calculate metrics
-        success_rate = sum(1 for s in steps if s.success) / len(steps) if steps else 0
-        complexity = len(set(s.action.get('type') for s in steps)) / len(steps) if steps else 0
-        
-        # Determine semantic type
-        semantic_type = cls._determine_semantic_type(steps)
-        
-        return cls(
-            steps=steps,
-            success_rate=success_rate,
-            complexity=complexity,
-            semantic_type=semantic_type
-        )
-    
-    @staticmethod
-    def _determine_semantic_type(steps: List[ActionStep]) -> str:
-        """Determine the semantic type of an action sequence"""
-        action_types = [s.action.get('type', '') for s in steps]
-        
-        if 'create_file' in action_types:
-            return 'create'
-        elif 'edit_file' in action_types:
-            return 'modify'
-        elif 'run_tests' in action_types:
-            return 'test'
-        elif 'resolve_conflict' in action_types:
-            return 'fix'
-        else:
-            return 'other'
-    
-    def matches_pattern(self, other: 'ActionSequence', fuzzy: bool = True) -> float:
-        """
-        Check if this sequence matches another sequence pattern
-        Returns similarity score between 0 and 1
-        """
-        if not self.steps or not other.steps:
-            return 0.0
-        
-        # Exact matching
-        if not fuzzy:
-            return 1.0 if all(
-                s1.action.get('type') == s2.action.get('type')
-                for s1, s2 in zip(self.steps, other.steps)
-            ) else 0.0
-        
-        # Fuzzy matching
-        matches = 0
-        total = max(len(self.steps), len(other.steps))
-        
-        for i in range(min(len(self.steps), len(other.steps))):
-            s1, s2 = self.steps[i], other.steps[i]
-            
-            # Type match
-            if s1.action.get('type') == s2.action.get('type'):
-                matches += 0.5
+            if isinstance(obs, dict):
+                success = obs.get('status') == 'success'
+                error = obs.get('error') if not success else None
+                steps.insert(0, ActionStep(
+                    action=action,
+                    state_before=obs.get('state_before', {}),
+                    state_after=obs.get('state_after', {}),
+                    success=success,
+                    error=error
+                ))
                 
-                # State transition similarity
-                if s1.success == s2.success:
-                    matches += 0.3
+        # Infer semantic type from action patterns
+        semantic_type = cls._infer_semantic_type(trajectory.actions)
+        
+        return cls(steps, semantic_type)
+
+    @staticmethod
+    def _infer_semantic_type(actions: List[Dict[str, Any]]) -> str:
+        """Infer the semantic type of an action sequence"""
+        action_types = [a.get('type', '') for a in actions]
+        
+        # Common patterns for different semantic types
+        patterns = {
+            'create': {'create_file', 'write_file', 'add_dependency'},
+            'modify': {'edit_file', 'update_file', 'rename_file'},
+            'test': {'run_test', 'check_test', 'verify'},
+            'fix': {'fix_error', 'resolve_conflict', 'update_imports'}
+        }
+        
+        # Score each semantic type based on action overlap
+        type_scores = defaultdict(int)
+        for action in action_types:
+            for sem_type, pattern_actions in patterns.items():
+                if any(pattern in action.lower() for pattern in pattern_actions):
+                    type_scores[sem_type] += 1
                     
-                # Action parameter similarity
-                shared_keys = set(s1.action.keys()) & set(s2.action.keys())
-                if shared_keys:
-                    param_matches = sum(
-                        1 for k in shared_keys
-                        if s1.action[k] == s2.action[k]
-                    )
-                    matches += 0.2 * (param_matches / len(shared_keys))
-        
-        return matches / total
-    
-    def is_subsequence_of(self, other: 'ActionSequence') -> bool:
-        """Check if this sequence is a subsequence of another sequence"""
-        if len(self.steps) > len(other.steps):
-            return False
-            
-        for i in range(len(other.steps) - len(self.steps) + 1):
-            if all(
-                s1.action.get('type') == s2.action.get('type')
-                for s1, s2 in zip(self.steps, other.steps[i:i+len(self.steps)])
-            ):
-                return True
-        return False
-    
-    def get_success_pattern(self) -> Optional['ActionSequence']:
-        """Extract the successful part of the sequence"""
-        successful_steps = [
-            step for step in self.steps
-            if step.success
-        ]
-        
-        if successful_steps:
-            return ActionSequence(
-                steps=successful_steps,
-                success_rate=1.0,
-                complexity=len(set(s.action.get('type') for s in successful_steps)) / len(successful_steps),
-                semantic_type=self._determine_semantic_type(successful_steps)
-            )
-        return None
+        # Return the most likely type, or 'other' if no clear match
+        if type_scores:
+            return max(type_scores.items(), key=lambda x: x[1])[0]
+        return 'other'
+
+    @property
+    def success_rate(self) -> float:
+        """Get the success rate of the sequence"""
+        return self._success_rate
+
+    def _calculate_success_rate(self) -> float:
+        """Calculate the success rate of the sequence"""
+        if not self.steps:
+            return 0.0
+        return sum(1 for step in self.steps if step.success) / len(self.steps)
 
 class SequencePattern:
-    """Represents a common pattern of successful actions"""
+    """Represents a common pattern extracted from multiple action sequences"""
     def __init__(self, sequences: List[ActionSequence]):
         self.sequences = sequences
-        self.frequency = len(sequences)
-        self.avg_success_rate = np.mean([s.success_rate for s in sequences])
-        self.avg_complexity = np.mean([s.complexity for s in sequences])
-        self.semantic_type = self._get_common_type()
-    
-    def _get_common_type(self) -> str:
-        """Get the most common semantic type"""
-        type_counts = {}
+        self.success_rate = self._calculate_pattern_success()
+        self.common_steps = self._extract_common_steps()
+
+    def _calculate_pattern_success(self) -> float:
+        """Calculate overall success rate of the pattern"""
+        if not self.sequences:
+            return 0.0
+        return sum(seq.success_rate for seq in self.sequences) / len(self.sequences)
+
+    def _extract_common_steps(self) -> List[Dict[str, Any]]:
+        """Extract common steps across sequences"""
+        if not self.sequences:
+            return []
+            
+        # Group similar actions by position in sequence
+        step_groups = defaultdict(list)
         for seq in self.sequences:
-            type_counts[seq.semantic_type] = type_counts.get(seq.semantic_type, 0) + 1
-        return max(type_counts.items(), key=lambda x: x[1])[0]
-    
-    def matches_sequence(self, sequence: ActionSequence, threshold: float = 0.7) -> bool:
-        """Check if a sequence matches this pattern"""
-        return any(
-            sequence.matches_pattern(s, fuzzy=True) >= threshold
-            for s in self.sequences
-        )
-    
-    def get_best_example(self) -> ActionSequence:
-        """Get the most successful example of this pattern"""
-        return max(self.sequences, key=lambda s: s.success_rate)
+            for i, step in enumerate(seq.steps):
+                step_groups[i].append(step.action)
+                
+        # Find most common action type at each position
+        common_steps = []
+        for pos in sorted(step_groups.keys()):
+            actions = step_groups[pos]
+            if actions:
+                # Group by action type
+                type_groups = defaultdict(list)
+                for action in actions:
+                    type_groups[action.get('type', '')].append(action)
+                    
+                # Get most common action type
+                most_common_type = max(type_groups.items(), key=lambda x: len(x[1]))[0]
+                common_steps.append({
+                    'type': most_common_type,
+                    'frequency': len(type_groups[most_common_type]) / len(actions)
+                })
+                
+        return common_steps
+
+    def get_best_example(self) -> Optional[ActionSequence]:
+        """Get the most successful sequence that follows this pattern"""
+        if not self.sequences:
+            return None
+            
+        return max(self.sequences, key=lambda seq: seq.success_rate)
+
+    def matches_state(self, state: Dict[str, Any], threshold: float = 0.6) -> bool:
+        """Check if a state matches the typical starting state for this pattern"""
+        if not self.sequences:
+            return False
+            
+        # Get starting states from all sequences
+        starting_states = [seq.steps[0].state_before for seq in self.sequences if seq.steps]
+        
+        # Compare state similarity with each starting state
+        for start_state in starting_states:
+            # Simple comparison of key features
+            matches = 0
+            total = 0
+            
+            for key in set(state.keys()) | set(start_state.keys()):
+                if key in state and key in start_state:
+                    if state[key] == start_state[key]:
+                        matches += 1
+                total += 1
+                
+            if total > 0 and matches / total >= threshold:
+                return True
+                
+        return False

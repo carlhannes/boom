@@ -5,6 +5,9 @@ import git
 from collections import deque
 import shutil
 import os
+from ..data.sequence import ActionSequence, SequencePattern
+from ..core.config import ConfigManager
+from ..data.quality_metrics import QualityMetrics
 
 class StateSnapshot:
     """Represents a point-in-time snapshot of repository state"""
@@ -16,70 +19,21 @@ class StateSnapshot:
 
 class ErrorRecoveryPattern:
     """Pattern for successful error recovery strategies"""
-    def __init__(self, error_type: str, actions: List[Dict[str, Any]], success_rate: float):
+    def __init__(self, error_type: str, sequence: ActionSequence):
         self.error_type = error_type
-        self.recovery_actions = actions
-        self.success_rate = success_rate
-        
-    @classmethod
-    def from_trajectory(cls, trajectory: Dict[str, Any]) -> Optional['ErrorRecoveryPattern']:
-        """Extract error recovery pattern from a trajectory if it contains successful recovery"""
-        error_actions = []
-        current_error = None
-        success_count = 0
-        total_recoveries = 0
-        
-        for i, (action, obs) in enumerate(zip(trajectory['actions'], trajectory['observations'])):
-            if isinstance(obs, dict) and obs.get('error'):
-                current_error = obs['error']
-                recovery_sequence = []
-                # Look ahead for recovery actions
-                for next_action, next_obs in zip(trajectory['actions'][i+1:], trajectory['observations'][i+1:]):
-                    recovery_sequence.append(next_action)
-                    if isinstance(next_obs, dict):
-                        if next_obs.get('status') == 'success':
-                            error_actions.append((current_error, recovery_sequence))
-                            success_count += 1
-                            break
-                        if next_obs.get('error'):
-                            break
-                total_recoveries += 1
-                
-        if error_actions:
-            # Group by error type and find most successful pattern
-            error_patterns = {}
-            for error, actions in error_actions:
-                error_type = cls._categorize_error(error)
-                if error_type not in error_patterns:
-                    error_patterns[error_type] = []
-                error_patterns[error_type].append(actions)
-            
-            # Get most common pattern for most frequent error type
-            if error_patterns:
-                error_type, patterns = max(error_patterns.items(), key=lambda x: len(x[1]))
-                most_common = max(set(tuple(p) for p in patterns), key=lambda x: patterns.count(x))
-                success_rate = success_count / total_recoveries
-                return cls(error_type, list(most_common), success_rate)
-        
-        return None
+        self.sequence = sequence
+        self.success_count = 1
+        self.total_attempts = 1
     
-    @staticmethod
-    def _categorize_error(error_msg: str) -> str:
-        """Categorize error message into general error type"""
-        error_msg = error_msg.lower()
-        if 'permission' in error_msg:
-            return 'permission_error'
-        if 'not found' in error_msg:
-            return 'not_found_error'
-        if 'conflict' in error_msg:
-            return 'merge_conflict'
-        if 'locked' in error_msg or 'busy' in error_msg:
-            return 'resource_locked'
-        return 'unknown_error'
+    @property
+    def success_rate(self) -> float:
+        return self.success_count / max(1, self.total_attempts)
     
-    def matches_error(self, error: str) -> bool:
-        """Check if this pattern matches an error message"""
-        return self.error_type == self._categorize_error(error)
+    def update(self, success: bool) -> None:
+        """Update pattern statistics after an attempt"""
+        self.total_attempts += 1
+        if success:
+            self.success_count += 1
 
 class GitEnvironment:
     def __init__(self, repo_path: str, max_history: int = 10):
@@ -94,7 +48,65 @@ class GitEnvironment:
         self.max_history = max_history
         self.state_history: Deque[StateSnapshot] = deque(maxlen=max_history)
         self.recovery_patterns: List[ErrorRecoveryPattern] = []
+        self.error_patterns: Dict[str, List[ErrorRecoveryPattern]] = {}
+        self.config = ConfigManager(repo_path).get_config()
+        self.quality_metrics = QualityMetrics(
+            min_quality_threshold=self.config.min_trajectory_quality
+        )
+        self.state_cache = {}
+        self._init_workspace()
         self._take_snapshot()  # Initial state
+    
+    def _init_workspace(self) -> None:
+        """Initialize workspace and storage"""
+        workspace_dir = Path(self.repo_path) / '.ai_agent'
+        workspace_dir.mkdir(exist_ok=True)
+        
+        # Create necessary subdirectories
+        (workspace_dir / 'storage').mkdir(exist_ok=True)
+        (workspace_dir / 'patterns').mkdir(exist_ok=True)
+        (workspace_dir / 'backups').mkdir(exist_ok=True)
+    
+    def add_recovery_pattern(self, error: str, actions: List[Dict[str, Any]], success: bool) -> None:
+        """Learn new error recovery pattern from actions"""
+        # Create action sequence from recovery attempt
+        sequence = ActionSequence(
+            steps=[],  # Will be populated from actions
+            semantic_type='fix'
+        )
+        
+        # Create or update error pattern
+        if error not in self.error_patterns:
+            self.error_patterns[error] = []
+            
+        # Find matching pattern or create new one
+        pattern = None
+        for existing in self.error_patterns[error]:
+            if self._sequences_match(existing.sequence, sequence):
+                pattern = existing
+                break
+                
+        if pattern:
+            pattern.update(success)
+        else:
+            pattern = ErrorRecoveryPattern(error, sequence)
+            self.error_patterns[error].append(pattern)
+    
+    def _sequences_match(self, seq1: ActionSequence, seq2: ActionSequence, 
+                        similarity_threshold: float = 0.8) -> bool:
+        """Check if two action sequences are similar enough to be considered the same pattern"""
+        if not seq1.steps or not seq2.steps:
+            return False
+            
+        # Compare action types in order
+        types1 = [step.action.get('type', '') for step in seq1.steps]
+        types2 = [step.action.get('type', '') for step in seq2.steps]
+        
+        # Calculate sequence similarity
+        matches = sum(1 for t1, t2 in zip(types1, types2) if t1 == t2)
+        max_len = max(len(types1), len(types2))
+        
+        return matches / max_len >= similarity_threshold
     
     def add_recovery_pattern(self, trajectory: Dict[str, Any]):
         """Learn new error recovery pattern from a trajectory"""
@@ -104,11 +116,19 @@ class GitEnvironment:
     
     def _get_recovery_actions(self, error: str) -> Optional[List[Dict[str, Any]]]:
         """Get recovery actions for an error based on learned patterns"""
-        matching_patterns = [p for p in self.recovery_patterns if p.matches_error(error)]
-        if matching_patterns:
-            # Use the pattern with highest success rate
-            best_pattern = max(matching_patterns, key=lambda p: p.success_rate)
-            return best_pattern.recovery_actions
+        if error not in self.error_patterns:
+            return None
+            
+        # Find most successful pattern
+        best_pattern = max(
+            self.error_patterns[error],
+            key=lambda p: p.success_rate,
+            default=None
+        )
+        
+        if best_pattern and best_pattern.success_rate >= 0.7:
+            return [step.action for step in best_pattern.sequence.steps]
+            
         return None
     
     def _take_snapshot(self) -> None:
@@ -564,3 +584,167 @@ class GitEnvironment:
             'test_path': test_path,
             'exit_code': pytest_output
         }
+
+    def execute(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute an action with safety checks and pattern tracking"""
+        # Check if action is allowed based on configuration
+        if not self._is_action_allowed(action):
+            return {
+                'status': 'error',
+                'error': 'Action not allowed by current configuration'
+            }
+        
+        # Create state backup if needed
+        if self._needs_backup(action):
+            self._create_backup()
+        
+        # Record state before action
+        state_before = self.get_state()
+        
+        try:
+            # Execute the action
+            result = self._execute_action(action)
+            
+            # Record state after action
+            state_after = self.get_state()
+            
+            # Update result with state information
+            result.update({
+                'state_before': state_before,
+                'state_after': state_after
+            })
+            
+            return result
+            
+        except Exception as e:
+            # Attempt recovery if enabled
+            if self.config.enable_continuous_learning:
+                recovery_result = self._attempt_recovery(str(e), state_before)
+                if recovery_result.get('status') == 'success':
+                    return recovery_result
+            
+            return {
+                'status': 'error',
+                'error': str(e),
+                'state_before': state_before
+            }
+    
+    def _is_action_allowed(self, action: Dict[str, Any]) -> bool:
+        """Check if action is allowed based on configuration"""
+        action_type = action.get('type', '')
+        
+        # Check for risky actions
+        risky_patterns = {'delete', 'remove', 'drop', 'truncate'}
+        is_risky = any(pattern in action_type.lower() for pattern in risky_patterns)
+        
+        if is_risky and not self.config.allow_risky_actions:
+            return False
+        
+        return True
+    
+    def _needs_backup(self, action: Dict[str, Any]) -> bool:
+        """Determine if action needs state backup"""
+        action_type = action.get('type', '').lower()
+        backup_patterns = {'delete', 'remove', 'rename', 'move', 'refactor'}
+        return any(pattern in action_type for pattern in backup_patterns)
+    
+    def _create_backup(self) -> None:
+        """Create backup of current state"""
+        backup_dir = Path(self.repo_path) / '.ai_agent' / 'backups'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save git state
+        git_state = {
+            'branch': self.repo.active_branch.name,
+            'commit': self.repo.head.commit.hexsha,
+            'changes': {
+                'staged': [item.a_path for item in self.repo.index.diff('HEAD')],
+                'unstaged': [item.a_path for item in self.repo.index.diff(None)]
+            }
+        }
+        
+        with open(backup_dir / f'git_state_{timestamp}.json', 'w') as f:
+            json.dump(git_state, f, indent=2)
+    
+    def analyze_patterns(self) -> Dict[str, List[str]]:
+        """Analyze codebase for patterns"""
+        patterns = {
+            'duplicate_code': [],
+            'complex_functions': [],
+            'low_coverage': []
+        }
+        
+        # Scan repository for pattern matches
+        for root, _, files in os.walk(self.repo_path):
+            if '.git' in root or '.ai_agent' in root:
+                continue
+                
+            for file in files:
+                if not any(file.endswith(ext) for ext in ['.py', '.js', '.java', '.cpp']):
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(file_path, self.repo_path)
+                
+                with open(file_path, 'r') as f:
+                    content = f.read()
+                    
+                    # Check for code duplication
+                    if self._has_duplicate_code(content):
+                        patterns['duplicate_code'].append(relative_path)
+                    
+                    # Check for complex functions
+                    if self._has_complex_functions(content):
+                        patterns['complex_functions'].append(relative_path)
+                    
+                    # Check test coverage
+                    if self._has_low_coverage(relative_path):
+                        patterns['low_coverage'].append(relative_path)
+        
+        return patterns
+    
+    def _has_duplicate_code(self, content: str) -> bool:
+        """Simple duplicate code detection"""
+        lines = content.split('\n')
+        line_hashes = {}
+        
+        for i in range(len(lines) - 5):
+            # Look for blocks of 6 similar lines
+            block = '\n'.join(lines[i:i+6])
+            block_hash = hash(block)
+            
+            if block_hash in line_hashes:
+                return True
+            line_hashes[block_hash] = i
+        
+        return False
+    
+    def _has_complex_functions(self, content: str) -> bool:
+        """Detect complex functions using simple metrics"""
+        import ast
+        
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    # Count branches and loops
+                    branches = sum(1 for _ in ast.walk(node) if isinstance(_, (ast.If, ast.For, ast.While)))
+                    if branches > 5:  # Simple complexity threshold
+                        return True
+        except:
+            pass
+        
+        return False
+    
+    def _has_low_coverage(self, file_path: str) -> bool:
+        """Check for test coverage"""
+        if file_path.endswith('.py'):
+            test_file = file_path.replace('.py', '_test.py')
+            test_file_alt = file_path.replace('.py', 'test.py')
+            
+            return not (
+                os.path.exists(os.path.join(self.repo_path, test_file)) or
+                os.path.exists(os.path.join(self.repo_path, test_file_alt))
+            )
+        
+        return False

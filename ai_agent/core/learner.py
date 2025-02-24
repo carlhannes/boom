@@ -6,6 +6,8 @@ import numpy as np
 from openai import OpenAI
 import os
 from sentence_transformers import SentenceTransformer
+from collections import defaultdict
+from .task_generator import TaskGenerator
 
 @dataclass
 class TaskExample:
@@ -13,6 +15,25 @@ class TaskExample:
     instruction: str
     context: Dict[str, Any]
     embedding: Optional[np.ndarray] = None
+
+class LearningRate:
+    """Adaptive learning rate based on pattern success"""
+    def __init__(self, initial_rate: float = 0.1):
+        self.rate = initial_rate
+        self.successes = 0
+        self.attempts = 0
+        
+    @property
+    def success_rate(self) -> float:
+        return self.successes / max(1, self.attempts)
+        
+    def update(self, success: bool) -> None:
+        self.attempts += 1
+        if success:
+            self.successes += 1
+            self.rate = min(0.5, self.rate * 1.1)  # Increase confidence
+        else:
+            self.rate = max(0.01, self.rate * 0.9)  # Decrease confidence
 
 class SelfLearner:
     def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None, client=None, embedding_model: str = "all-MiniLM-L6-v2"):
@@ -45,6 +66,12 @@ class SelfLearner:
                 self.embedding_model = None
             else:
                 raise e
+
+        self.instruction_cache = {}
+        self.embedding_cache = {}
+        self.task_generator = TaskGenerator()
+        self.learned_patterns = defaultdict(list)
+        self.learning_rates = defaultdict(LearningRate)
 
     def _analyze_repository_state(self, repo_files: List[str], git_status: Dict[str, List[str]]) -> Dict[str, Any]:
         """Analyze repository state to inform task generation"""
@@ -573,3 +600,311 @@ Return a single action as JSON object with 'type' and required parameters."""
                     return best_pattern['suggested_actions'][current_step]
         
         return None
+
+    def backward_construct(self, trajectory: 'Trajectory') -> str:
+        """
+        Construct a more accurate instruction from a successful trajectory.
+        This aligns instructions with what was actually done.
+        """
+        # Analyze actions and their results
+        action_groups = self._group_related_actions(trajectory.actions)
+        objectives = []
+        
+        for group in action_groups:
+            # Get the primary type of actions in this group
+            action_type = group[0].get('type', '')
+            
+            if action_type.startswith('create'):
+                objectives.append(f"Create {group[0].get('file', 'new file')}")
+            elif action_type.startswith('edit'):
+                files = {a.get('file') for a in group if 'file' in a}
+                objectives.append(f"Modify {', '.join(files)}")
+            elif action_type.startswith('test'):
+                objectives.append("Run and verify tests")
+            elif action_type.startswith('fix'):
+                objectives.append(f"Fix issues in {group[0].get('file', 'code')}")
+            elif action_type.startswith('add'):
+                objectives.append(f"Add {group[0].get('what', 'component')}")
+        
+        # Check final state for additional context
+        if trajectory.final_state:
+            if 'test_results' in trajectory.final_state:
+                if trajectory.final_state['test_results'].get('status') == 'pass':
+                    objectives.append("Ensure all tests pass")
+            
+            if 'git_status' in trajectory.final_state:
+                status = trajectory.final_state['git_status']
+                if status.get('staged'):
+                    objectives.append("Stage changes")
+                if status.get('committed'):
+                    objectives.append("Commit changes")
+        
+        # Construct natural instruction
+        if len(objectives) == 1:
+            return objectives[0]
+        elif len(objectives) == 2:
+            return f"{objectives[0]} and {objectives[1]}"
+        elif len(objectives) > 2:
+            return f"{', '.join(objectives[:-1])}, and {objectives[-1]}"
+        else:
+            return trajectory.instruction  # Fallback to original if no clear objectives
+
+    def _group_related_actions(self, actions: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Group related actions together based on type and target"""
+        if not actions:
+            return []
+            
+        groups = []
+        current_group = [actions[0]]
+        
+        for action in actions[1:]:
+            prev_action = current_group[-1]
+            
+            # Check if actions are related
+            if (action.get('type', '').split('_')[0] == prev_action.get('type', '').split('_')[0] or
+                action.get('file') == prev_action.get('file')):
+                current_group.append(action)
+            else:
+                groups.append(current_group)
+                current_group = [action]
+        
+        groups.append(current_group)
+        return groups
+
+    def refine_instruction_library(self, trajectory_manager: 'TrajectoryManager'):
+        """
+        Refine instructions in trajectory library using backward construction.
+        This helps align stored examples with what was actually accomplished.
+        """
+        updated_count = 0
+        
+        for trajectory in trajectory_manager.trajectories:
+            if trajectory.compute_quality_metrics().success_rate >= 0.8:
+                # Only refine instructions for highly successful trajectories
+                new_instruction = self.backward_construct(trajectory)
+                
+                if new_instruction != trajectory.instruction:
+                    # Store as a new trajectory with refined instruction
+                    refined_trajectory = type('Trajectory', (), {
+                        'instruction': new_instruction,
+                        'actions': trajectory.actions,
+                        'observations': trajectory.observations,
+                        'final_state': trajectory.final_state
+                    })()
+                    
+                    trajectory_manager.store_trajectory(refined_trajectory)
+                    updated_count += 1
+        
+        return updated_count
+
+    def generate_plan(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate action plan for an instruction"""
+        # TODO: Implement actual plan generation using chosen model
+        # For now return empty plan
+        return []
+
+    def bootstrap_learning(self, 
+                         docs_path: str, 
+                         framework_info: Dict[str, Any],
+                         file_patterns: Dict[str, Any],
+                         trajectory_manager: 'TrajectoryManager') -> int:
+        """
+        Bootstrap learning by generating and executing tasks from documentation
+        Returns the number of successful trajectories generated
+        """
+        # Generate tasks from all available sources
+        tasks = []
+        tasks.extend(self.task_generator.extract_tasks_from_docs(Path(docs_path)))
+        tasks.extend(self.task_generator.generate_framework_tasks(framework_info))
+        tasks.extend(self.task_generator.generate_codebase_tasks(file_patterns))
+        
+        # Filter out duplicates
+        unique_tasks = self.task_generator.filter_duplicate_tasks(tasks)
+        
+        # Sort tasks by priority
+        unique_tasks.sort(key=lambda t: 0 if t.get('priority') == 'high' else 1)
+        
+        successful_count = 0
+        
+        # Execute each task and learn from results
+        for task in unique_tasks:
+            try:
+                result = self.agent.execute_task(task['instruction'])
+                if result.get('status') == 'success':
+                    successful_count += 1
+                    
+                    # Learn from successful execution
+                    if 'trajectory' in result:
+                        # Refine instruction through backward construction
+                        refined_instruction = self.backward_construct(result['trajectory'])
+                        
+                        # Store refined trajectory
+                        refined_trajectory = type('Trajectory', (), {
+                            'instruction': refined_instruction,
+                            'actions': result['trajectory'].actions,
+                            'observations': result['trajectory'].observations,
+                            'final_state': result['trajectory'].final_state
+                        })()
+                        
+                        trajectory_manager.store_trajectory(refined_trajectory)
+                        
+                        # Extract and store any successful patterns
+                        self._learn_patterns(refined_trajectory)
+            except Exception as e:
+                # Log error but continue with other tasks
+                print(f"Error executing task '{task['instruction']}': {str(e)}")
+                continue
+        
+        return successful_count
+
+    def _learn_patterns(self, trajectory: 'Trajectory') -> None:
+        """Learn successful patterns from a trajectory"""
+        if trajectory.compute_quality_metrics().success_rate >= 0.8:
+            # Group related actions
+            action_groups = self._group_related_actions(trajectory.actions)
+            
+            for group in action_groups:
+                # Create pattern signature from action types
+                pattern_key = tuple(a.get('type', '') for a in group)
+                
+                # Store successful pattern with context
+                self.learned_patterns[pattern_key].append({
+                    'actions': group,
+                    'state_before': trajectory.observations[0].get('state_before', {}),
+                    'success_rate': trajectory.compute_quality_metrics().success_rate
+                })
+    
+    def get_similar_patterns(self, 
+                           action_sequence: List[Dict[str, Any]], 
+                           state: Dict[str, Any],
+                           min_success_rate: float = 0.8) -> List[Dict[str, Any]]:
+        """Get similar successful patterns for an action sequence"""
+        if not action_sequence:
+            return []
+            
+        # Create pattern signature from sequence
+        pattern_key = tuple(a.get('type', '') for a in action_sequence)
+        
+        matching_patterns = []
+        
+        # Look for exact matches
+        if pattern_key in self.learned_patterns:
+            matching_patterns.extend(
+                pattern for pattern in self.learned_patterns[pattern_key]
+                if pattern['success_rate'] >= min_success_rate
+            )
+        
+        # Look for partial matches (subsequences)
+        for key in self.learned_patterns:
+            if len(key) >= len(pattern_key):
+                continue
+                
+            # Check if this is a subsequence of our pattern
+            for i in range(len(pattern_key) - len(key) + 1):
+                if pattern_key[i:i+len(key)] == key:
+                    matching_patterns.extend(
+                        pattern for pattern in self.learned_patterns[key]
+                        if pattern['success_rate'] >= min_success_rate
+                    )
+        
+        return matching_patterns
+
+    def learn_from_trajectory(self, 
+                            trajectory: 'Trajectory',
+                            config: Optional['AgentConfig'] = None) -> None:
+        """Learn from a trajectory with adaptive rates"""
+        if trajectory.compute_quality_metrics().success_rate < 0.8:
+            return
+            
+        # Extract pattern signature
+        pattern_key = self._get_pattern_key(trajectory)
+        
+        # Get or create learning rate for this pattern
+        rate = self.learning_rates[pattern_key]
+        
+        # Update learning rate based on trajectory success
+        rate.update(True)
+        
+        # Learn pattern with current rate
+        if rate.success_rate >= (config.min_pattern_success_rate if config else 0.8):
+            self._learn_patterns(trajectory)
+            
+            # If pattern is highly successful, refine instruction
+            if rate.success_rate >= 0.9:
+                refined = self.backward_construct(trajectory)
+                if refined != trajectory.instruction:
+                    # Store refined version with high confidence
+                    refined_trajectory = type('Trajectory', (), {
+                        'instruction': refined,
+                        'actions': trajectory.actions,
+                        'observations': trajectory.observations,
+                        'final_state': trajectory.final_state,
+                        'compute_quality_metrics': trajectory.compute_quality_metrics
+                    })()
+                    return refined_trajectory
+        
+        return None
+    
+    def _get_pattern_key(self, trajectory: 'Trajectory') -> str:
+        """Generate a unique key for a trajectory pattern"""
+        action_types = [a.get('type', '') for a in trajectory.actions]
+        state_changes = getattr(trajectory, 'state_changes', [])
+        change_types = [c.type for c in state_changes]
+        
+        return f"{':'.join(action_types)}|{':'.join(change_types)}"
+    
+    def get_pattern_confidence(self, pattern_key: str) -> float:
+        """Get confidence level for a pattern"""
+        rate = self.learning_rates[pattern_key]
+        return rate.success_rate * rate.rate
+    
+    def should_explore_pattern(self, pattern_key: str, min_confidence: float = 0.3) -> bool:
+        """Determine if a pattern should be explored"""
+        # Always explore if pattern is new
+        if pattern_key not in self.learning_rates:
+            return True
+            
+        rate = self.learning_rates[pattern_key]
+        
+        # Explore if:
+        # 1. Pattern has high success rate but low attempts (need more data)
+        # 2. Pattern has medium success rate and good learning rate
+        # 3. Pattern is above minimum confidence threshold
+        return (
+            (rate.success_rate >= 0.8 and rate.attempts < 5) or
+            (rate.success_rate >= 0.6 and rate.rate >= 0.2) or
+            (self.get_pattern_confidence(pattern_key) >= min_confidence)
+        )
+    
+    def generate_plan(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate plan with exploration vs exploitation"""
+        # Look for matching patterns
+        similar = self.get_similar_patterns(
+            [{'type': 'analyze'}],  # Initial dummy action to match patterns
+            state,
+            min_success_rate=0.8
+        )
+        
+        best_pattern = None
+        best_confidence = 0.0
+        
+        for pattern in similar:
+            pattern_key = self._get_pattern_key(pattern)
+            confidence = self.get_pattern_confidence(pattern_key)
+            
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_pattern = pattern
+        
+        # Decide whether to explore or exploit
+        if best_pattern and best_confidence >= 0.7:
+            # Exploit: use successful pattern
+            return best_pattern.actions
+        else:
+            # Explore: generate new plan
+            return self._generate_new_plan(instruction, state)
+    
+    def _generate_new_plan(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate a new plan when exploring"""
+        # TODO: Implement actual plan generation using chosen model
+        return []
