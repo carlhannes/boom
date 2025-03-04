@@ -154,7 +154,7 @@ def test_find_matching_patterns(trajectory_manager_with_data):
         'languages': ['python'],
         'patterns': ['testing']
     }
-
+    
     # Add some test patterns
     trajectory_manager_with_data.patterns = {
         'test': {
@@ -166,9 +166,14 @@ def test_find_matching_patterns(trajectory_manager_with_data):
             'type': 'create',
             'actions': [{'type': 'create_file', 'path': 'src/*.py'}],
             'success_rate': 0.9
+        },
+        'modify': {
+            'type': 'modify',
+            'actions': [{'type': 'edit_file', 'path': 'src/*.py'}],
+            'success_rate': 0.8
         }
     }
-
+    
     # Test create pattern
     create_matches = trajectory_manager_with_data._find_matching_patterns(
         "Create new validation module",
@@ -184,7 +189,7 @@ def test_find_matching_patterns(trajectory_manager_with_data):
         current_state
     )
     assert len(modify_matches) > 0
-    assert any(seq.semantic_type == 'modify' for seq in modify_matches)
+    assert modify_matches[0]['type'] == 'modify'  # Changed to check for 'type' instead of 'semantic_type'
     
 def test_pattern_based_retrieval(tmp_path):
     """Test enhanced retrieval with pattern matching"""
@@ -458,6 +463,9 @@ def test_quality_filtered_retrieval(tmp_path):
     # Store trajectories
     for traj in trajectories:
         manager.store_trajectory(traj)
+    
+    # Override patterns to ensure BM25 retrieval is used instead of pattern matching
+    manager.patterns = {}
         
     # Test retrieval with quality filter
     results = manager.retrieve_similar_trajectories(
