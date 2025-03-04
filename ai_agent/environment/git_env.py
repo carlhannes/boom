@@ -5,6 +5,8 @@ import git
 from collections import deque
 import shutil
 import os
+import json
+from datetime import datetime
 from ..data.sequence import ActionSequence, SequencePattern
 from ..core.config import ConfigManager
 from ..data.quality_metrics import QualityMetrics
@@ -34,6 +36,20 @@ class ErrorRecoveryPattern:
         self.total_attempts += 1
         if success:
             self.success_count += 1
+            
+    @classmethod
+    def from_trajectory(cls, trajectory: Dict[str, Any]):
+        """Create pattern from trajectory data"""
+        if 'error' not in trajectory or not trajectory.get('actions'):
+            return None
+            
+        error_type = trajectory['error']
+        sequence = ActionSequence(
+            actions=trajectory['actions'],
+            semantic_type='fix'
+        )
+        
+        return cls(error_type, sequence)
 
 class GitEnvironment:
     def __init__(self, repo_path: str, max_history: int = 10):
@@ -44,11 +60,23 @@ class GitEnvironment:
             max_history: Maximum number of state snapshots to keep
         """
         self.repo_path = Path(repo_path)
-        self.repo = git.Repo(repo_path)
+        self.repo_path.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            self.repo = git.Repo(repo_path)
+        except (git.exc.InvalidGitRepositoryError, git.exc.NoSuchPathError):
+            # Initialize new repo if it doesn't exist
+            self.repo = git.Repo.init(repo_path)
+            readme = self.repo_path / 'README.md'
+            if not readme.exists():
+                readme.write_text('# Initial Repository')
+                self.repo.index.add(['README.md'])
+                self.repo.index.commit('Initial commit')
+        
         self.max_history = max_history
-        self.state_history: Deque[StateSnapshot] = deque(maxlen=max_history)
-        self.recovery_patterns: List[ErrorRecoveryPattern] = []
-        self.error_patterns: Dict[str, List[ErrorRecoveryPattern]] = {}
+        self.state_history = deque(maxlen=max_history)
+        self.recovery_patterns = []
+        self.error_patterns = {}
         self.config = ConfigManager(repo_path).get_config()
         self.quality_metrics = QualityMetrics(
             min_quality_threshold=self.config.min_trajectory_quality
@@ -67,11 +95,11 @@ class GitEnvironment:
         (workspace_dir / 'patterns').mkdir(exist_ok=True)
         (workspace_dir / 'backups').mkdir(exist_ok=True)
     
-    def add_recovery_pattern(self, error: str, actions: List[Dict[str, Any]], success: bool) -> None:
+    def add_recovery_pattern(self, error: str, actions: List[Dict[str, Any]], success: bool = True) -> None:
         """Learn new error recovery pattern from actions"""
         # Create action sequence from recovery attempt
         sequence = ActionSequence(
-            steps=[],  # Will be populated from actions
+            actions=actions,
             semantic_type='fix'
         )
         
@@ -95,12 +123,12 @@ class GitEnvironment:
     def _sequences_match(self, seq1: ActionSequence, seq2: ActionSequence, 
                         similarity_threshold: float = 0.8) -> bool:
         """Check if two action sequences are similar enough to be considered the same pattern"""
-        if not seq1.steps or not seq2.steps:
+        if not seq1.actions or not seq2.actions:
             return False
             
         # Compare action types in order
-        types1 = [step.action.get('type', '') for step in seq1.steps]
-        types2 = [step.action.get('type', '') for step in seq2.steps]
+        types1 = [action.get('type', '') for action in seq1.actions]
+        types2 = [action.get('type', '') for action in seq2.actions]
         
         # Calculate sequence similarity
         matches = sum(1 for t1, t2 in zip(types1, types2) if t1 == t2)
@@ -108,26 +136,21 @@ class GitEnvironment:
         
         return matches / max_len >= similarity_threshold
     
-    def add_recovery_pattern(self, trajectory: Dict[str, Any]):
-        """Learn new error recovery pattern from a trajectory"""
-        pattern = ErrorRecoveryPattern.from_trajectory(trajectory)
-        if pattern and pattern.success_rate > 0.7:  # Only keep highly successful patterns
-            self.recovery_patterns.append(pattern)
-    
     def _get_recovery_actions(self, error: str) -> Optional[List[Dict[str, Any]]]:
         """Get recovery actions for an error based on learned patterns"""
         if error not in self.error_patterns:
             return None
             
         # Find most successful pattern
-        best_pattern = max(
-            self.error_patterns[error],
-            key=lambda p: p.success_rate,
-            default=None
-        )
+        best_pattern = None
+        if self.error_patterns[error]:
+            best_pattern = max(
+                self.error_patterns[error],
+                key=lambda p: p.success_rate
+            )
         
         if best_pattern and best_pattern.success_rate >= 0.7:
-            return [step.action for step in best_pattern.sequence.steps]
+            return best_pattern.sequence.actions
             
         return None
     
@@ -620,7 +643,7 @@ class GitEnvironment:
             # Attempt recovery if enabled
             if self.config.enable_continuous_learning:
                 recovery_result = self._attempt_recovery(str(e), state_before)
-                if recovery_result.get('status') == 'success':
+                if recovery_result and recovery_result.get('status') == 'success':
                     return recovery_result
             
             return {
@@ -666,6 +689,64 @@ class GitEnvironment:
         with open(backup_dir / f'git_state_{timestamp}.json', 'w') as f:
             json.dump(git_state, f, indent=2)
     
+    def _execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute action based on type"""
+        action_type = action.get('type', '')
+        
+        if action_type == 'edit_file':
+            return self._edit_file(action.get('path', ''), action.get('content', ''))
+        elif action_type == 'git_commit':
+            return self._commit_changes(action.get('message', 'Commit changes'))
+        elif action_type == 'git_checkout':
+            return self._checkout_branch(action.get('branch', 'main'), action.get('create', False))
+        elif action_type == 'run_tests':
+            return self._run_tests(action.get('test_path'))
+        elif action_type == 'fix_permissions':
+            return self._fix_permissions(action.get('path'))
+        elif action_type == 'resolve_conflict':
+            return self._resolve_conflict(action.get('path', ''))
+        else:
+            return {
+                'status': 'error',
+                'error': f"Unknown action type: {action_type}"
+            }
+    
+    def _attempt_recovery(self, error: str, state_before: Dict[str, Any]) -> Dict[str, Any]:
+        """Attempt to recover from an error"""
+        # Try to find recovery actions
+        recovery_actions = self._get_recovery_actions(error)
+        
+        if not recovery_actions:
+            return {
+                'status': 'error',
+                'error': f"No recovery pattern found for: {error}"
+            }
+            
+        # Try each recovery action
+        results = []
+        success = True
+        
+        for action in recovery_actions:
+            try:
+                result = self._execute_action(action)
+                results.append(result)
+                if result.get('status') != 'success':
+                    success = False
+                    break
+            except Exception:
+                success = False
+                break
+                
+        # Update pattern success rate
+        self.add_recovery_pattern(error, recovery_actions, success)
+        
+        return {
+            'status': 'success' if success else 'error',
+            'recovery_actions': recovery_actions,
+            'recovery_results': results,
+            'original_error': error
+        }
+
     def analyze_patterns(self) -> Dict[str, List[str]]:
         """Analyze codebase for patterns"""
         patterns = {

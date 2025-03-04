@@ -1,9 +1,11 @@
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 import json
 import time
+import os  # Added missing os import
 from pathlib import Path
 import numpy as np
 from rank_bm25 import BM25Okapi
+from dataclasses import dataclass
 
 # Only for type hints
 if TYPE_CHECKING:
@@ -13,223 +15,263 @@ from .state_analyzer import StateChangeAnalyzer, StateChange
 from .sequence import SequencePattern, ActionSequence
 
 class TrajectoryQualityMetrics:
-    """Metrics for assessing trajectory quality"""
-    def __init__(self, trajectory: 'Trajectory'):
-        self.success_rate = self._calculate_success_rate(trajectory)
-        self.completion = self._calculate_completion(trajectory)
-        self.complexity = self._calculate_complexity(trajectory)
+    """Evaluates and tracks quality metrics for trajectories"""
+    def __init__(self):
+        self.quality_metrics = QualityMetrics()
+        self.quality_history = []
         
-    def _calculate_success_rate(self, trajectory: 'Trajectory') -> float:
-        """Calculate the success rate of actions in the trajectory"""
-        if not trajectory.observations:
-            return 0.0
-        
-        successes = sum(
-            1 for obs in trajectory.observations
-            if isinstance(obs, dict) and obs.get('status') == 'success'
-        )
-        return successes / len(trajectory.observations)
-        
-    def _calculate_completion(self, trajectory: 'Trajectory') -> float:
-        """Assess how complete the trajectory is"""
-        if not trajectory.actions:
-            return 0.0
+    def evaluate_trajectory(self, trajectory: 'Trajectory') -> QualityScore:
+        """Evaluate quality metrics for a trajectory"""
+        score = self.quality_metrics.assess_trajectory(trajectory)
+        self.quality_history.append(score)
+        return score
+    
+    def get_quality_trend(self, window: int = 10) -> Dict[str, float]:
+        """Get quality metric trends over recent trajectories"""
+        if not self.quality_history:
+            return {
+                'success_trend': 0.0,
+                'coverage_trend': 0.0,
+                'complexity_trend': 0.0,
+                'risk_trend': 0.0,
+                'total_trend': 0.0
+            }
             
-        # Check for explicit completion marker
-        if trajectory.observations and isinstance(trajectory.observations[-1], dict):
-            if trajectory.observations[-1].get('status') == 'complete':
-                return 1.0
-                
-        # Otherwise estimate based on action outcomes
-        return self.success_rate
-        
-    def _calculate_complexity(self, trajectory: 'Trajectory') -> float:
-        """Assess trajectory complexity (0-1 scale)"""
-        if not trajectory.actions:
-            return 0.0
+        recent = self.quality_history[-window:]
+        if len(recent) < 2:
+            return {
+                'success_trend': recent[0].success_rate,
+                'coverage_trend': recent[0].coverage_score,
+                'complexity_trend': recent[0].complexity_score,
+                'risk_trend': recent[0].risk_score,
+                'total_trend': recent[0].total_score
+            }
             
-        # Base complexity on action variety and count
-        unique_action_types = len({a.get('type') for a in trajectory.actions})
-        action_count = len(trajectory.actions)
+        # Calculate trends using linear regression
+        x = np.arange(len(recent))
+        trends = {}
         
-        # Normalize complexity score
-        return min(1.0, (unique_action_types * 0.4 + action_count * 0.1))
+        for metric in ['success_rate', 'coverage_score', 'complexity_score', 'risk_score']:
+            y = np.array([getattr(score, metric) for score in recent])
+            slope = np.polyfit(x, y, 1)[0]
+            trends[f"{metric.split('_')[0]}_trend"] = slope
+            
+        # Calculate total score trend
+        y = np.array([score.total_score for score in recent])
+        trends['total_trend'] = np.polyfit(x, y, 1)[0]
         
-    def get_overall_score(self) -> float:
-        """Calculate overall quality score (0-1)"""
-        return (
-            self.success_rate * 0.4 +    # Weight success most heavily
-            self.completion * 0.4 +      # Completion is equally important
-            self.complexity * 0.2        # Complexity matters but less so
+        return trends
+
+    def get_quality_summary(self) -> Dict[str, Any]:
+        """Get summary statistics of trajectory quality"""
+        if not self.quality_history:
+            return {
+                'total_trajectories': 0,
+                'avg_success_rate': 0.0,
+                'avg_coverage': 0.0,
+                'avg_complexity': 0.0,
+                'avg_risk': 0.0,
+                'high_quality_ratio': 0.0
+            }
+            
+        scores = np.array([
+            [score.success_rate, score.coverage_score,
+             score.complexity_score, score.risk_score]
+            for score in self.quality_history
+        ])
+        
+        high_quality = sum(
+            1 for score in self.quality_history
+            if score.total_score >= 0.8
         )
+        
+        return {
+            'total_trajectories': len(self.quality_history),
+            'avg_success_rate': float(np.mean(scores[:, 0])),
+            'avg_coverage': float(np.mean(scores[:, 1])),
+            'avg_complexity': float(np.mean(scores[:, 2])),
+            'avg_risk': float(np.mean(scores[:, 3])),
+            'high_quality_ratio': high_quality / len(self.quality_history)
+        }
+
+class QualityMetrics:
+    def __init__(self, success_rate: float = 0.0):
+        self._metrics = {'success_rate': success_rate}
+    
+    def get(self, key: str, default: float = 0.0) -> float:
+        return self._metrics.get(key, default)
+        
+    @property
+    def success_rate(self) -> float:
+        return self._metrics['success_rate']
 
 class Trajectory:
-    def __init__(self, 
-                instruction: str,
-                actions: List[Dict[str, Any]],
-                observations: List[Dict[str, Any]],
-                final_state: Dict[str, Any]):
+    """Represents a sequence of actions and observations with quality metrics"""
+    def __init__(self, instruction: str, actions: List[Dict[str, Any]], 
+                 observations: List[Dict[str, Any]], final_state: Dict[str, Any],
+                 quality_metrics: Optional['QualityMetrics'] = None):
         self.instruction = instruction
         self.actions = actions
         self.observations = observations
         self.final_state = final_state
-        self._embedding: Optional[np.ndarray] = None
-        self.quality: Optional[TrajectoryQualityMetrics] = None
-
-    def compute_quality_metrics(self) -> TrajectoryQualityMetrics:
-        """Compute quality metrics for this trajectory"""
-        if self.quality is None:
-            self.quality = TrajectoryQualityMetrics(self)
-        return self.quality
-
+        self.quality_metrics = quality_metrics
+        self.quality_score = None
+        self._success_rate = None
+        
+    @property
+    def success_rate(self) -> float:
+        """Calculate success rate of trajectory execution"""
+        if self._success_rate is None:
+            if not self.observations:
+                self._success_rate = 0.0
+            else:
+                successes = sum(
+                    1 for obs in self.observations
+                    if isinstance(obs, dict) and obs.get('status') == 'success'
+                )
+                self._success_rate = successes / len(self.observations)
+        return self._success_rate
+    
     def to_dict(self) -> Dict[str, Any]:
-        """Convert trajectory to dictionary for storage"""
-        data = {
+        """Convert trajectory to dictionary representation"""
+        return {
             'instruction': self.instruction,
             'actions': self.actions,
             'observations': self.observations,
-            'final_state': self.final_state
+            'final_state': self.final_state,
+            'success_rate': self.success_rate,
+            'quality_metrics': self.quality_metrics._metrics if self.quality_metrics else None,
+            'quality_score': self.quality_score.total_score if self.quality_score else None
         }
-        if self.quality:
-            data['quality'] = {
-                'success_rate': self.quality.success_rate,
-                'completion': self.quality.completion,
-                'complexity': self.quality.complexity,
-                'overall_score': self.quality.get_overall_score()
-            }
-        return data
         
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Trajectory':
-        """Create trajectory from dictionary"""
-        traj = cls(
+        """Create trajectory from dictionary representation"""
+        quality_metrics = None
+        if 'quality_metrics' in data and data['quality_metrics']:
+            quality_metrics = QualityMetrics()
+            quality_metrics._metrics = data['quality_metrics']
+            
+        trajectory = cls(
             instruction=data['instruction'],
             actions=data['actions'],
             observations=data['observations'],
-            final_state=data['final_state']
+            final_state=data['final_state'],
+            quality_metrics=quality_metrics
         )
-        if 'quality' in data:
-            traj.quality = TrajectoryQualityMetrics(traj)
-        return traj
+        if 'quality_score' in data:
+            trajectory.quality_score = QualityScore(
+                success_rate=data.get('success_rate', 0.0),
+                coverage_score=data.get('coverage_score', 0.0),
+                complexity_score=data.get('complexity_score', 0.0),
+                risk_score=data.get('risk_score', 0.0)
+            )
+        return trajectory
 
-def simple_tokenize(text: str) -> List[str]:
-    """Tokenize text for BM25 indexing, preserving code-specific terms"""
-    # Split on whitespace but preserve dots for file extensions
+def simple_tokenize(text):
+    """Tokenize text while preserving file extensions and code-specific tokens"""
     tokens = []
-    for word in text.split():
-        # If word contains a dot (likely a file extension), keep it whole
+    words = text.split()
+    for word in words:
+        # Handle file paths and extensions
         if '.' in word:
-            tokens.append(word.lower().strip('!,.?;:'))
-        else:
-            # Otherwise split and lowercase
-            clean_word = word.lower().strip('!,.?;:')
-            if clean_word:
-                tokens.append(clean_word)
+            base, ext = os.path.splitext(word)
+            if ext.lower() in ['.py', '.js', '.ts', '.jsx', '.tsx']:
+                tokens.append(word.lower().strip('.,!?()[]{}'))
+                continue
+        # Normal word tokenization
+        tokens.append(word.lower().strip('.,!?()[]{}'))
     return tokens
 
 class TrajectoryManager:
-    def __init__(self, storage_path: str, learner: Optional[SelfLearner] = None):
-        """Initialize TrajectoryManager with optional learner for testing"""
-        self.storage_path = Path(storage_path)
-        self.storage_path.mkdir(parents=True, exist_ok=True)
-        self.learner = learner or SelfLearner()
-        self.bm25_index = None
+    def __init__(self, storage_path: str, learner=None):
+        self.storage_path = storage_path
         self.trajectories = []
-        self.min_quality_threshold = 0.5  # Minimum quality score to keep trajectory
-        self.quality_metrics = QualityMetrics()
-        self.trajectory_scores: Dict[int, QualityScore] = {}
-        self.state_analyzer = StateChangeAnalyzer()
-        
-        # Load existing trajectories
-        stored = self.load_trajectories()
-        if stored:
-            self.trajectories.extend(stored)
-            self.rebuild_index()  # Only build index if we have trajectories
+        self.error_patterns = {}
+        self.bm25_index = None
+        self.learner = learner
+        self._initialize_bm25()
+
+    def _initialize_bm25(self):
+        """Initialize BM25 index"""
+        if not self.trajectories:
+            return
+            
+        # Build corpus from trajectory instructions and actions
+        corpus = []
+        for traj in self.trajectories:
+            doc = f"{traj.instruction} "
+            doc += " ".join([str(a.get('type', '')) + " " + str(a.get('path', '')) for a in traj.actions])
+            corpus.append(doc.split())
+            
+        # Initialize BM25 index
+        self.bm25_index = BM25Okapi(corpus)
 
     def rebuild_index(self):
-        """Build BM25 index from stored trajectories"""
-        if not hasattr(self, 'trajectories'):
-            self.trajectories = []
-        
-        stored = self.load_trajectories()
-        if stored:
-            self.trajectories.extend(stored)
-        
-        # Filter low-quality trajectories
-        filtered_trajectories = []
-        for traj in self.trajectories:
-            metrics = traj.compute_quality_metrics()
-            if metrics.get_overall_score() >= self.min_quality_threshold:
-                filtered_trajectories.append(traj)
-        
-        self.trajectories = filtered_trajectories
-        
-        # Build BM25 index
-        tokenized_docs = []
-        if self.trajectories:
-            # Prepare documents for BM25
-            for traj in self.trajectories:
-                tokens = simple_tokenize(traj.instruction)
-                tokenized_docs.append(tokens)
-        else:
-            # Add a dummy document to avoid division by zero
-            tokenized_docs.append(['dummy'])
-            
-        self.bm25_index = BM25Okapi(tokenized_docs)
-    
-    def store_trajectory(self, trajectory: Trajectory) -> bool:
-        """Store trajectory with state change analysis"""
-        # Analyze state changes
-        changes = []
-        for i in range(len(trajectory.observations) - 1):
-            state_before = trajectory.observations[i].get('state_before', {})
-            state_after = trajectory.observations[i + 1].get('state_after', {})
-            
-            if state_before and state_after:
-                changes.extend(
-                    self.state_analyzer.analyze_change(state_before, state_after)
-                )
-        
-        # Compute quality with state change impact
-        score = self.quality_metrics.compute_trajectory_quality(
-            trajectory,
-            trajectory.instruction
-        )
-        
-        # Adjust quality score based on state changes
-        if changes:
-            avg_impact = sum(c.impact for c in changes) / len(changes)
-            adjusted_score = QualityScore(
-                success_rate=score.success_rate,
-                consistency=score.consistency,
-                efficiency=score.efficiency * (1 - 0.2 * avg_impact),  # Penalize high-impact changes
-                relevance=score.relevance,
-                safety=score.safety * (1 - 0.3 * avg_impact)  # Reduce safety score for high-impact changes
-            )
-        else:
-            adjusted_score = score
-        
-        # Check if trajectory should be stored
-        if self.quality_metrics.should_filter_trajectory(adjusted_score):
-            return False
-            
-        # Update patterns with state changes
-        self.state_analyzer._update_patterns(changes)
-        
-        # Store trajectory with enhanced metadata
-        trajectory_id = len(self.trajectories)
+        """Rebuild BM25 index"""
+        self._initialize_bm25()
+
+    def store_trajectory(self, trajectory):
+        """Store trajectory and update indexes"""
         self.trajectories.append(trajectory)
-        self.trajectory_scores[trajectory_id] = adjusted_score
+        self._initialize_bm25()  # Rebuild index
+        self._extract_error_patterns(trajectory)
+
+    def _extract_error_patterns(self, trajectory):
+        """Extract error patterns from trajectory"""
+        for i, obs in enumerate(trajectory.observations):
+            if obs.get('status') == 'error' and obs.get('error'):
+                error_type = obs['error']
+                if error_type not in self.error_patterns:
+                    self.error_patterns[error_type] = []
+                    
+                # Record error context and recovery
+                if i + 1 < len(trajectory.actions):
+                    recovery_action = trajectory.actions[i + 1]
+                    self.error_patterns[error_type].append({
+                        'context': trajectory.actions[i],
+                        'recovery': recovery_action
+                    })
+
+    def _find_matching_patterns(self, instruction: str, current_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Find patterns that match the current query and state"""
+        matches = []
         
-        # Store state changes for future reference
-        if not hasattr(trajectory, 'state_changes'):
-            trajectory.state_changes = changes
+        # Extract relevant terms from instruction
+        instruction_terms = set(instruction.lower().split())
         
-        # Rebuild index if needed
-        if self.bm25_index is not None:
-            self.rebuild_index()
+        # Match against stored patterns
+        for pattern_id, pattern in self.patterns.items():
+            score = 0.0
             
-        return True
+            # Match pattern type against instruction
+            if pattern['type'] in instruction.lower():
+                score += 0.5
+                
+            # Match pattern actions against state
+            if any(self._action_matches_state(action, current_state) 
+                  for action in pattern['actions']):
+                score += 0.3
+                
+            # Consider pattern success rate
+            score += pattern.get('success_rate', 0) * 0.2
+            
+            if score > 0.5:  # Minimum threshold for relevance
+                matches.append({
+                    'pattern': pattern,
+                    'score': score
+                })
+                
+        # Sort by score
+        matches.sort(key=lambda x: x['score'], reverse=True)
+        return [m['pattern'] for m in matches]
+
+    def _action_matches_state(self, action: Dict[str, Any], state: Dict[str, Any]) -> bool:
+        """Check if an action is relevant to current state"""
+        if 'file' in action and 'files' in state:
+            # Check if action targets existing files
+            return any(f.endswith(action['file']) for f in state['files'])
+        return False
 
     def maintain_quality(self, min_score: float = 0.7) -> int:
         """
@@ -371,41 +413,34 @@ class TrajectoryManager:
                 
         return patterns
 
-    def _find_matching_patterns(self, query: str, current_state: Dict[str, Any]) -> List[ActionSequence]:
-        """Find action patterns that match the query and current state"""
-        patterns = self._extract_action_patterns()
+    def _calculate_state_compatibility(self, pattern: Dict[str, Any], state: Dict[str, Any]) -> float:
+        """Calculate how compatible a pattern is with the current state"""
+        if 'required_state' not in pattern:
+            return 0.5  # Neutral score if no requirements
+            
+        req_state = pattern['required_state']
+        matches = 0
+        total = len(req_state)
         
-        # Convert query to probable semantic types
-        query_lower = query.lower()
-        likely_types = set()
-        
-        if any(word in query_lower for word in ['create', 'add', 'new']):
-            likely_types.add('create')
-        if any(word in query_lower for word in ['edit', 'update', 'modify', 'change']):
-            likely_types.add('modify')
-        if any(word in query_lower for word in ['test', 'verify', 'check']):
-            likely_types.add('test')
-        if any(word in query_lower for word in ['fix', 'repair', 'resolve']):
-            likely_types.add('fix')
-        
-        matching_sequences = []
-        
-        # Check each pattern type that matches query semantics
-        for sem_type in likely_types:
-            if sem_type in patterns:
-                pattern = patterns[sem_type]
+        for key, value in req_state.items():
+            if key in state and state[key] == value:
+                matches += 1
                 
-                # Get the best example from each matching pattern
-                example = pattern.get_best_example()
-                
-                # Verify state compatibility
-                if self._compute_state_similarity(
-                    current_state,
-                    example.steps[0].state_before
-                ) > 0.6:  # Reasonable state match threshold
-                    matching_sequences.append(example)
+        return matches / total if total > 0 else 0.5
+
+    def _calculate_query_relevance(self, pattern: Dict[str, Any], query: str) -> float:
+        """Calculate relevance of pattern to query"""
+        if 'description' not in pattern:
+            return 0.0
+            
+        pattern_tokens = set(simple_tokenize(pattern['description']))
+        query_tokens = set(simple_tokenize(query))
         
-        return matching_sequences
+        if not pattern_tokens or not query_tokens:
+            return 0.0
+            
+        common_tokens = pattern_tokens.intersection(query_tokens)
+        return len(common_tokens) / len(query_tokens)
 
     def retrieve_similar_trajectories(self,
                                    current_state: Dict[str, Any],
@@ -418,86 +453,29 @@ class TrajectoryManager:
             return []
             
         # First get candidates using text similarity
-        query_tokens = simple_tokenize(instruction)
+        query_tokens = instruction.lower().split()
         if not self.bm25_index:
             self.rebuild_index()
             
+        if not self.bm25_index:  # Still no index after rebuild
+            return []
+            
+        # Get BM25 scores and rank trajectories
         bm25_scores = self.bm25_index.get_scores(query_tokens)
-        max_score = max(bm25_scores) if any(bm25_scores) else 1.0
-        top_k_indices = np.argsort(bm25_scores)[-bm25_top_k:][::-1]
+        scored_trajectories = list(zip(self.trajectories, bm25_scores))
+        scored_trajectories.sort(key=lambda x: x[1], reverse=True)
         
-        # Get current changes if available
-        current_changes = []
-        if hasattr(current_state, 'previous_state'):
-            current_changes = self.state_analyzer.analyze_change(
-                current_state.get('previous_state', {}),
-                current_state
-            )
-        
-        scored_candidates = []
-        
-        for idx in top_k_indices:
-            traj = self.trajectories[idx]
-            
-            # Calculate different similarity components
-            bm25_score = bm25_scores[idx] / max_score
-            
-            # Get trajectory's state changes
-            trajectory_changes = getattr(traj, 'state_changes', [])
-            
-            # Calculate state pattern similarity if we have current changes
-            state_similarity = 0.0
-            if current_changes and trajectory_changes:
-                similar_patterns = self.state_analyzer.get_similar_changes(
-                    current_changes,
-                    threshold=0.6
-                )
-                if similar_patterns:
-                    max_similarity = max(
-                        self._calculate_change_similarity(current_changes, pattern)
-                        for pattern in similar_patterns
-                    )
-                    state_similarity = max_similarity
-            
-            # Get environment context match
-            context_sim = self._compute_context_match(
-                current_state,
-                traj.final_state
-            )
-            
-            # Calculate action applicability score
-            action_score = self._compute_action_applicability(
-                current_state,
-                traj.actions
-            )
-            
-            # Calculate semantic similarity if embeddings available
-            semantic_sim = 0.0
-            if hasattr(traj, '_embedding') and traj._embedding is not None:
-                query_embedding = self.learner.compute_embedding(instruction)
-                semantic_sim = np.dot(query_embedding, traj._embedding)
-            
-            # Get quality score
-            quality_score = self.get_trajectory_quality(
-                self.trajectories.index(traj)
-            )
-            
-            if quality_score and quality_score.total_score >= min_quality:
-                # Combine all scores with weights
-                final_score = (
-                    0.25 * bm25_score +           # Text similarity
-                    0.20 * state_similarity +      # State change patterns
-                    0.20 * context_sim +          # Environment context
-                    0.15 * action_score +         # Action applicability  
-                    0.10 * semantic_sim +         # Semantic similarity
-                    0.10 * quality_score.total_score  # Trajectory quality
-                )
+        # Filter by quality and get top results
+        results = []
+        for traj, score in scored_trajectories[:bm25_top_k]:
+            if hasattr(traj, 'quality_metrics') and traj.quality_metrics:
+                success_rate = getattr(traj.quality_metrics, 'success_rate', 0)
+                if success_rate >= min_quality:
+                    results.append(traj)
+            if len(results) >= limit:
+                break
                 
-                scored_candidates.append((final_score, traj))
-        
-        # Sort by final score and return top results
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in scored_candidates[:limit]]
+        return results
 
     def _calculate_change_similarity(self,
                                   changes1: List[StateChange],
@@ -676,3 +654,13 @@ class TrajectoryManager:
         """Store a successful error recovery trajectory"""
         if recovery_trajectory.compute_quality_metrics().success_rate >= 0.8:
             self.store_trajectory(recovery_trajectory)
+
+@dataclass
+class QualityScore:
+    success_rate: float = 0.0
+    coverage_score: float = 0.0
+    complexity_score: float = 0.0
+    risk_score: float = 0.0
+    efficiency: float = 0.0
+    relevance: float = 0.0
+    safety: float = 1.0

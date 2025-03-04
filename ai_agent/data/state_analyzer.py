@@ -5,194 +5,195 @@ import difflib
 import json
 from collections import defaultdict
 import time
+from datetime import datetime
 
 @dataclass
 class StateChange:
-    """Represents a change in repository state"""
-    type: str  # Type of change (file, git, dependency, etc)
-    path: str  # Affected path or resource
-    before: Any  # State before change
-    after: Any  # State after change
-    impact: float  # Impact score of change (0-1)
+    action_type: str
+    target: str
+    old_state: Optional[Dict[str, Any]]
+    new_state: Optional[Dict[str, Any]]
+    impact: float
+    
+    @property
+    def type(self):
+        """Backward compatibility for tests"""
+        return self.action_type
+        
+    @property
+    def path(self):
+        """Backward compatibility for tests"""
+        return self.target
 
 class StateChangeAnalyzer:
-    """Analyzes and tracks state changes in the repository"""
+    MAX_HISTORY_SIZE = 100  # Maximum number of states to keep in history
     
     def __init__(self):
-        self.state_history: List[Dict[str, Any]] = []
-        self.change_patterns = defaultdict(list)
-        self.safe_paths: Set[str] = set()
+        self.pattern_history = []
+        self.state_history = []
+        self.safe_paths = set()
+        self.patterns = []
+        self.impact_weights = {
+            'file_modified': 0.5,
+            'file_created': 0.6,
+            'file_deleted': 0.9,
+            'file_moved': 0.4
+        }
+
+    def is_safe_path(self, path):
+        """Check if a path has been safely modified in the past"""
+        return path in self.safe_paths
         
-    def analyze_change(self, 
-                      state_before: Dict[str, Any],
-                      state_after: Dict[str, Any]) -> List[StateChange]:
-        """Analyze changes between two states"""
+    def get_recent_states(self, count):
+        """Get the most recent states"""
+        return self.state_history[-count:] if self.state_history else []
+
+    def _compute_pattern_similarity(self, pattern1: List[StateChange], 
+                                  pattern2: List[StateChange]) -> float:
+        """Calculate similarity between two change patterns"""
+        if not pattern1 or not pattern2:
+            return 1.0 if not pattern1 and not pattern2 else 0.0
+            
+        # Compare action types and targets
+        similar_actions = 0
+        total_comparisons = max(len(pattern1), len(pattern2))
+        
+        for i in range(min(len(pattern1), len(pattern2))):
+            if pattern1[i].action_type == pattern2[i].action_type:
+                similar_actions += 0.7
+                if pattern1[i].target == pattern2[i].target:
+                    similar_actions += 0.3
+                    
+        return similar_actions / total_comparisons
+
+    def compute_total_impact(self, changes: List[StateChange]) -> float:
+        """Compute total impact score for a set of changes"""
+        if not changes:
+            return 0.0
+            
+        # Normalize the total impact to be between 0 and 1
+        total_impact = sum(change.impact for change in changes) 
+        return min(1.0, total_impact)
+
+    def _update_history(self, state):
+        """Update state history with new state"""
+        self.state_history.append(state)
+        if len(self.state_history) > self.MAX_HISTORY_SIZE:
+            self.state_history.pop(0)
+
+    def analyze_changes(self, old_state: Dict[str, Any], new_state: Dict[str, Any]) -> List[StateChange]:
+        """Analyze changes between states and return StateChange objects"""
         changes = []
         
         # Analyze file changes
-        files_before = set(state_before.get('files', []))
-        files_after = set(state_after.get('files', []))
+        old_files = set(old_state.get('files', []))
+        new_files = set(new_state.get('files', []))
         
-        # New files
-        for file in files_after - files_before:
+        # Added files
+        for file in new_files - old_files:
             changes.append(StateChange(
-                type='file_created',
-                path=file,
-                before=None,
-                after={'exists': True},
-                impact=self._compute_file_impact(file)
+                action_type='file_created',
+                target=file,
+                old_state=None,
+                new_state={'exists': True},
+                impact=self.impact_weights.get('file_created', 0.6)
             ))
-        
-        # Deleted files
-        for file in files_before - files_after:
+            
+        # Removed files
+        for file in old_files - new_files:
             changes.append(StateChange(
-                type='file_deleted',
-                path=file,
-                before={'exists': True},
-                after=None,
-                impact=self._compute_file_impact(file)
+                action_type='file_deleted',
+                target=file,
+                old_state={'exists': True},
+                new_state=None,
+                impact=self.impact_weights.get('file_deleted', 0.8)  # Higher impact for deletions
             ))
-        
-        # Modified files
-        for file in files_before & files_after:
-            if self._file_content_changed(state_before, state_after, file):
+            
+        # Modified files (those that exist in both states)
+        for file in old_files & new_files:
+            old_content = old_state.get('file_contents', {}).get(file)
+            new_content = new_state.get('file_contents', {}).get(file)
+            if old_content != new_content:
                 changes.append(StateChange(
-                    type='file_modified',
-                    path=file,
-                    before=self._get_file_state(state_before, file),
-                    after=self._get_file_state(state_after, file),
-                    impact=self._compute_file_impact(file)
+                    action_type='file_modified',
+                    target=file,
+                    old_state={'content': old_content},
+                    new_state={'content': new_content},
+                    impact=self.impact_weights.get('file_modified', 0.3)
                 ))
         
-        # Analyze git changes
-        git_before = state_before.get('git_status', {})
-        git_after = state_after.get('git_status', {})
-        
-        if git_before != git_after:
-            changes.append(StateChange(
-                type='git_state',
-                path='repository',
-                before=git_before,
-                after=git_after,
-                impact=self._compute_git_impact(git_before, git_after)
-            ))
-        
-        # Record state and update patterns
-        self._update_history(state_after)
         self._update_patterns(changes)
-        
         return changes
-    
+
+    def _update_patterns(self, changes: List[StateChange]) -> None:
+        """Update pattern database with new changes"""
+        if len(changes) > 1:
+            self.patterns.append(changes)
+            
+        # Update safe paths for modified files
+        for change in changes:
+            if change.action_type in ['file_modified']:
+                self.safe_paths.add(change.target)
+
     def _compute_file_impact(self, file_path: str) -> float:
-        """Compute impact score for file changes"""
-        # Higher impact for certain file types
-        high_impact = {'.py', '.js', '.java', 'requirements.txt', 'package.json'}
-        medium_impact = {'.md', '.txt', '.json', '.yml', '.yaml'}
+        """Calculate impact score for changes to a given file"""
+        # Higher impact for critical files
+        critical_patterns = ['config.', 'settings.', 'security.', 'auth.', '.env']
+        base_impact = 0.5  # Default impact
         
-        ext = Path(file_path).suffix
+        path = Path(file_path)
+        file_name = path.name.lower()
         
-        if any(file_path.endswith(p) for p in high_impact):
-            base_impact = 0.8
-        elif any(file_path.endswith(p) for p in medium_impact):
-            base_impact = 0.5
-        else:
-            base_impact = 0.3
+        # Check for critical files - high impact
+        for pattern in critical_patterns:
+            if pattern in file_name:
+                return min(1.0, base_impact * 1.8)  # Significantly higher impact
+        
+        # Medium impact for documentation
+        if file_name.endswith(('.md', '.txt', '.rst')):
+            return base_impact * 0.8  # Medium impact
+                
+        # Lower impact for test and log files
+        if 'test' in str(path).lower() or file_name.endswith(('.log', '.test')):
+            return base_impact * 0.5  # Lower impact
+        elif any(dir_name in str(path).lower() for dir_name in ['core', 'main', 'auth']):
+            return base_impact * 1.3  # Higher impact for core functionality
             
-        # Adjust based on path safety
-        if file_path in self.safe_paths:
-            base_impact *= 0.8
+        return base_impact
             
-        return min(1.0, base_impact)
-    
-    def _compute_git_impact(self, 
-                          before: Dict[str, Any], 
-                          after: Dict[str, Any]) -> float:
-        """Compute impact score for git state changes"""
+    def _compute_git_impact(self, git_before: Dict, git_after: Dict) -> float:
+        """Calculate impact of Git state changes"""
         impact = 0.0
         
-        # Check for commits
-        if after.get('commit') != before.get('commit'):
+        # Check for branch changes
+        if git_before.get('branch') != git_after.get('branch'):
+            impact += 0.4
+        
+        # Check for commit changes
+        if git_before.get('commit') != git_after.get('commit'):
             impact += 0.3
             
-        # Check for branch changes
-        if after.get('branch') != before.get('branch'):
-            impact += 0.4
-            
-        # Check for staged/unstaged changes
-        staged_before = set(before.get('staged', []))
-        staged_after = set(after.get('staged', []))
-        if staged_before != staged_after:
-            impact += 0.2
-            
-        unstaged_before = set(before.get('unstaged', []))
-        unstaged_after = set(after.get('unstaged', []))
-        if unstaged_before != unstaged_after:
-            impact += 0.1
+        # Check for staging changes
+        before_staged = set(git_before.get('staged', []))
+        after_staged = set(git_after.get('staged', []))
+        staged_changes = len(before_staged ^ after_staged)
+        impact += min(0.3, staged_changes * 0.1)
             
         return min(1.0, impact)
-    
-    def _update_history(self, state: Dict[str, Any]) -> None:
-        """Update state history"""
-        self.state_history.append(state)
-        if len(self.state_history) > 100:  # Keep last 100 states
-            self.state_history.pop(0)
-    
-    def _update_patterns(self, changes: List[StateChange]) -> None:
-        """Update change patterns"""
-        if not changes:
-            return
-            
-        # Create pattern signature
-        pattern = tuple((c.type, c.impact > 0.7) for c in changes)
-        self.change_patterns[pattern].append({
-            'changes': changes,
-            'timestamp': time.time()
-        })
-        
-        # Update safe paths based on successful patterns
-        for change in changes:
-            if (change.type in ('file_modified', 'file_created') and 
-                len(self.change_patterns[pattern]) >= 3):
-                self.safe_paths.add(change.path)
-    
-    def get_similar_changes(self, 
-                          changes: List[StateChange], 
-                          threshold: float = 0.7) -> List[List[StateChange]]:
-        """Find similar change patterns from history"""
-        if not changes:
+
+    def get_similar_changes(self, changes: List[StateChange], threshold: float = 0.7) -> List[List[StateChange]]:
+        """Find similar change patterns in history"""
+        if not changes or not self.patterns:
             return []
             
-        pattern = tuple((c.type, c.impact > 0.7) for c in changes)
-        similar = []
-        
-        for p, instances in self.change_patterns.items():
-            if self._pattern_similarity(pattern, p) >= threshold:
-                similar.extend(inst['changes'] for inst in instances)
+        similar_patterns = []
+        for pattern in self.patterns:
+            similarity = self._compute_pattern_similarity(changes, pattern)
+            if similarity >= threshold:
+                similar_patterns.append(pattern)
                 
-        return similar
-    
-    def _pattern_similarity(self, pattern1: tuple, pattern2: tuple) -> float:
-        """Compute similarity between change patterns"""
-        if not pattern1 or not pattern2:
-            return 0.0
-            
-        # Use longest common subsequence
-        matcher = difflib.SequenceMatcher(None, pattern1, pattern2)
-        return matcher.ratio()
-    
-    def _file_content_changed(self,
-                            state_before: Dict[str, Any],
-                            state_after: Dict[str, Any],
-                            file_path: str) -> bool:
-        """Check if file content changed between states"""
-        before_hash = state_before.get('file_hashes', {}).get(file_path)
-        after_hash = state_after.get('file_hashes', {}).get(file_path)
-        return before_hash != after_hash
-    
-    def _get_file_state(self, state: Dict[str, Any], file_path: str) -> Dict[str, Any]:
-        """Get file state information"""
-        return {
-            'hash': state.get('file_hashes', {}).get(file_path),
-            'size': state.get('file_sizes', {}).get(file_path),
-            'last_modified': state.get('file_times', {}).get(file_path)
-        }
+        return similar_patterns
+
+    def analyze_change(self, state_before: Dict[str, Any], state_after: Dict[str, Any]) -> List[StateChange]:
+        """Alias for analyze_changes to fix test compatibility"""
+        return self.analyze_changes(state_before, state_after)

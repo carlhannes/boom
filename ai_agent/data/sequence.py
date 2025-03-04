@@ -3,81 +3,112 @@ from typing import List, Dict, Any, Optional, Sequence
 import numpy as np
 from collections import defaultdict
 
-@dataclass
 class ActionStep:
-    """Represents a single step in an action sequence"""
-    action: Dict[str, Any]
-    state_before: Dict[str, Any]
-    state_after: Dict[str, Any]
-    success: bool
-    error: Optional[str] = None
+    """Represents a single action step in a sequence"""
+    def __init__(self, action: Dict[str, Any]):
+        self.action_data = action  # Store the action data
+        
+    @property
+    def action(self) -> Dict[str, Any]:
+        """Get the action data"""
+        return self.action_data
+        
+    @property
+    def action_type(self) -> str:
+        """Get the action type"""
+        return self.action_data.get('type', '')
 
 class ActionSequence:
-    """Represents a sequence of actions with their states and outcomes"""
-    def __init__(self, steps: List[ActionStep], semantic_type: str):
-        self.steps = steps
-        self.semantic_type = semantic_type
-        self._success_rate = self._calculate_success_rate()
-
-    @classmethod
-    def from_trajectory(cls, trajectory: 'Trajectory') -> 'ActionSequence':
-        """Create an action sequence from a trajectory"""
-        steps = []
-        states = [trajectory.final_state]  # Start with final state
-        
-        # Work backwards through actions and observations
-        for action, obs in zip(reversed(trajectory.actions), reversed(trajectory.observations)):
-            if isinstance(obs, dict):
-                success = obs.get('status') == 'success'
-                error = obs.get('error') if not success else None
-                steps.insert(0, ActionStep(
-                    action=action,
-                    state_before=obs.get('state_before', {}),
-                    state_after=obs.get('state_after', {}),
-                    success=success,
-                    error=error
-                ))
-                
-        # Infer semantic type from action patterns
-        semantic_type = cls._infer_semantic_type(trajectory.actions)
-        
-        return cls(steps, semantic_type)
-
-    @staticmethod
-    def _infer_semantic_type(actions: List[Dict[str, Any]]) -> str:
-        """Infer the semantic type of an action sequence"""
-        action_types = [a.get('type', '') for a in actions]
-        
-        # Common patterns for different semantic types
-        patterns = {
-            'create': {'create_file', 'write_file', 'add_dependency'},
-            'modify': {'edit_file', 'update_file', 'rename_file'},
-            'test': {'run_test', 'check_test', 'verify'},
-            'fix': {'fix_error', 'resolve_conflict', 'update_imports'}
-        }
-        
-        # Score each semantic type based on action overlap
-        type_scores = defaultdict(int)
-        for action in action_types:
-            for sem_type, pattern_actions in patterns.items():
-                if any(pattern in action.lower() for pattern in pattern_actions):
-                    type_scores[sem_type] += 1
-                    
-        # Return the most likely type, or 'other' if no clear match
-        if type_scores:
-            return max(type_scores.items(), key=lambda x: x[1])[0]
-        return 'other'
+    def __init__(self, actions=None, semantic_type=None):
+        self.actions = actions or []
+        self._semantic_type = semantic_type
+        self._cached_score = None
+        self.steps: List[ActionStep] = []
+        self.success_rate: float = 0.0
+        self.pattern_type: str = ""
 
     @property
-    def success_rate(self) -> float:
-        """Get the success rate of the sequence"""
-        return self._success_rate
+    def semantic_type(self):
+        if not self._semantic_type:
+            self._infer_semantic_type()
+        return self._semantic_type
 
-    def _calculate_success_rate(self) -> float:
-        """Calculate the success rate of the sequence"""
+    def _infer_semantic_type(self):
+        """Infer semantic type from actions"""
+        if not self.actions:
+            self._semantic_type = 'empty'
+            return
+
+        first_action = self.actions[0]
+        action_types = [a['type'] for a in self.actions]
+        
+        if 'test' in ' '.join(action_types).lower():
+            self._semantic_type = 'test'
+        elif first_action['type'] == 'create_file':
+            self._semantic_type = 'create'
+        elif first_action['type'] == 'edit_file':
+            self._semantic_type = 'modify'
+        elif first_action['type'] == 'git_commit':
+            self._semantic_type = 'commit'
+        else:
+            self._semantic_type = first_action['type']
+
+    @classmethod
+    def from_trajectory(cls, trajectory) -> 'ActionSequence':
+        """Create sequence from trajectory"""
+        sequence = cls()
+        if not hasattr(trajectory, 'actions') or not hasattr(trajectory, 'observations'):
+            return sequence
+
+        for i, action in enumerate(trajectory.actions):
+            observation = trajectory.observations[i] if i < len(trajectory.observations) else None
+            step = ActionStep(action)
+            sequence.steps.append(step)
+
+        # Calculate success rate
+        if trajectory.observations:
+            successes = sum(1 for obs in trajectory.observations 
+                          if isinstance(obs, dict) and obs.get('status') == 'success')
+            sequence.success_rate = successes / len(trajectory.observations)
+
+        # Determine pattern type
+        sequence.pattern_type = sequence._determine_pattern_type()
+        return sequence
+
+    def _determine_pattern_type(self) -> str:
+        """Determine the type of pattern this sequence represents"""
         if not self.steps:
-            return 0.0
-        return sum(1 for step in self.steps if step.success) / len(self.steps)
+            return ""
+
+        # Common patterns
+        test_actions = {'create_test', 'run_tests', 'write_test'}
+        model_actions = {'create_model', 'edit_model', 'update_schema'}
+        git_actions = {'git_commit', 'git_push', 'git_checkout'}
+
+        action_types = {step.action_type for step in self.steps}
+
+        if any(a in test_actions for a in action_types):
+            return "test"
+        elif any(a in model_actions for a in action_types):
+            return "model"
+        elif any(a in git_actions for a in action_types):
+            return "git"
+        return "general"
+
+    def matches_state(self, state: Dict) -> bool:
+        """Check if sequence matches given state"""
+        if not self.steps:
+            return False
+
+        # Check file existence requirements
+        required_files = {
+            param.get('path') for step in self.steps 
+            for param in [step.action]
+            if isinstance(param, dict) and 'path' in param
+        }
+
+        state_files = set(state.get('files', []))
+        return all(any(req_file in f for f in state_files) for req_file in required_files)
 
 class SequencePattern:
     """Represents a common pattern extracted from multiple action sequences"""

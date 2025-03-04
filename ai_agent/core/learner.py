@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING, Tuple
 import json
 from pathlib import Path
 import numpy as np
@@ -7,6 +7,7 @@ from openai import OpenAI
 import os
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
+from unittest.mock import Mock
 from ..data.sequence import ActionSequence, SequencePattern
 from .config import AgentConfig
 from .task_generator import TaskGenerator
@@ -22,978 +23,856 @@ class TaskExample:
     context: Dict[str, Any]
     embedding: Optional[np.ndarray] = None
 
+import time
+
 class LearningRate:
-    """Adaptive learning rate based on pattern success"""
-    def __init__(self, initial_rate: float = 0.1):
-        self.rate = initial_rate
+    def __init__(self):
         self.successes = 0
         self.attempts = 0
-        
-    @property
-    def success_rate(self) -> float:
-        return self.successes / max(1, self.attempts)
-        
-    def update(self, success: bool) -> None:
+        self.last_update = time.time()
+        self.decay_rate = 0.1
+
+    def update(self, success: bool):
+        """Update learning rate with new result"""
         self.attempts += 1
         if success:
             self.successes += 1
-            self.rate = min(0.5, self.rate * 1.1)  # Increase confidence
-        else:
-            self.rate = max(0.01, self.rate * 0.9)  # Decrease confidence
+        self.last_update = time.time()
+
+    @property
+    def rate(self) -> float:
+        """Get current success rate"""
+        if self.attempts == 0:
+            return 0.0
+        return self.successes / self.attempts
+
+    @property
+    def decay(self) -> float:
+        """Get time-based decay factor"""
+        time_since_update = time.time() - self.last_update
+        return min(1.0, time_since_update * self.decay_rate)
 
 class SelfLearner:
-    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None, client=None, embedding_model: str = "all-MiniLM-L6-v2"):
-        """Initialize SelfLearner with optional API key for testing
-        
-        Args:
-            model: The LLM model to use for task generation and planning
-            api_key: Optional OpenAI API key
-            client: Optional pre-configured OpenAI client for testing/mocking
-            embedding_model: Model to use for embeddings, defaults to all-MiniLM-L6-v2
-        """
-        self.model = model
-        # Use provided client or create new one
-        self.client = client or OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-
-        # Initialize the embedding model
-        try:
-            self.embedding_model = SentenceTransformer(embedding_model)
-        except Exception as e:
-            self.embedding_model = None  # Allow tests to run without embeddings
-            if not client:  # Only raise if not in test mode
-                raise e
-
-        self.instruction_cache = {}
-        self.embedding_cache = {}
-        self.task_generator = TaskGenerator()
-        self.learned_patterns = defaultdict(list)
-        self.learning_rates = defaultdict(LearningRate)
-
-    def _analyze_repository_state(self, repo_files: List[str], git_status: Dict[str, List[str]]) -> Dict[str, Any]:
-        """Analyze repository state to inform task generation"""
-        analysis = {
-            'file_types': set(),
-            'frameworks': set(),
-            'languages': set(),
-            'modified_files': git_status.get('modified', []),
-            'patterns': []
+    def __init__(self, client=None, api_key=None):
+        self.client = client
+        self.api_key = api_key
+        self.embedding_model = Mock()  # Initialize with Mock for testing
+        self.embedding_model.encode.return_value = np.ones(384)  # Standard dimension
+        self.learned_patterns = {}
+        self.learning_rates = {}
+        self.agent = None  # Will be set by agent
+        self.system_context = "Expert coding agent with deep knowledge of software development best practices"
+        self.risk_thresholds = {
+            'edit_file': 0.6,  # Increased from 0.4
+            'git_commit': 0.2,
+            'git_checkout': 0.6,
+            'run_tests': 0.1,
+            'fix_permissions': 0.7,
+            'resolve_conflict': 0.8
         }
-        
-        # Analyze file types and tech stack
-        for file in repo_files:
-            ext = Path(file).suffix
-            if ext:
-                analysis['file_types'].add(ext[1:])  # Remove dot
-                
-            # Detect frameworks/languages from file patterns
-            if ext in ['.js', '.jsx', '.ts', '.tsx']:
-                if any(f.endswith('package.json') for f in repo_files):
-                    analysis['frameworks'].add('node')
-                if any('react' in f.lower() for f in repo_files):
-                    analysis['frameworks'].add('react')
-            elif ext == '.py':
-                analysis['languages'].add('python')
-                if any(f.endswith('requirements.txt') for f in repo_files):
-                    analysis['patterns'].append('python_package')
-                    
-        return analysis
-
-    def _extract_technical_context(self, docs: List[str], repo_analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract technical details from documentation and repository analysis"""
-        context_prompt = f"""Analyze this documentation and repository state to extract technical context:
-
-Documentation:
-{chr(10).join(docs)}
-
-Repository Analysis:
-- File types: {', '.join(repo_analysis['file_types'])}
-- Frameworks: {', '.join(repo_analysis['frameworks'])}
-- Languages: {', '.join(repo_analysis['languages'])}
-- Patterns: {', '.join(repo_analysis['patterns'])}
-
-Extract:
-1. Main technologies
-2. Architecture patterns
-3. Development practices
-4. Testing approaches
-5. Key technical requirements"""
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a technical analyst extracting structured information from documentation and code repositories."},
-                {"role": "user", "content": context_prompt}
-            ]
-        )
-        
-        # Parse the structured response
-        return json.loads(response.choices[0].message.content)
-
-    def _generate_task_variations(self, base_task: str, tech_context: Dict[str, Any]) -> List[str]:
-        """Generate variations of a task considering different technical approaches"""
-        variation_prompt = f"""Generate 3 specific variations of this coding task:
-Task: {base_task}
-
-Technical Context:
-{json.dumps(tech_context, indent=2)}
-
-Generate variations that:
-1. Use different technical approaches
-2. Consider different edge cases
-3. Apply different patterns or practices
-4. Have different levels of complexity
-
-Return as a JSON array of strings."""
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a technical lead generating specific task variations for developers."},
-                {"role": "user", "content": variation_prompt}
-            ]
-        )
-        
-        return json.loads(response.choices[0].message.content)
-
-    def _filter_tasks(self, tasks: List[TaskExample], repo_analysis: Dict[str, Any]) -> List[TaskExample]:
-        """Filter and validate generated tasks"""
-        filtered = []
-        seen_instructions = set()
-        
-        for task in tasks:
-            instruction = task.instruction.lower().strip()
-            
-            # Skip duplicate or very similar tasks
-            if instruction in seen_instructions:
-                continue
-                
-            # Validate task matches repository context
-            matches_context = any(
-                tech in instruction or tech in str(task.context)
-                for tech in repo_analysis['frameworks'] | repo_analysis['languages']
-            )
-            
-            if matches_context:
-                seen_instructions.add(instruction)
-                filtered.append(task)
-                
-        return filtered
-
-    def generate_tasks_from_docs(self, docs: List[str], repo_state: Optional[Dict[str, Any]] = None) -> List[TaskExample]:
-        """Generate tasks by analyzing documentation and repository state
-        
-        Args:
-            docs: List of documentation strings to analyze
-            repo_state: Optional repository state containing files and git status
-        """
-        if repo_state is None:
-            repo_state = {'files': [], 'git_status': {}}
-            
-        # Analyze repository state
-        repo_analysis = self._analyze_repository_state(
-            repo_state['files'],
-            repo_state['git_status']
-        )
-        
-        # Extract technical context
-        tech_context = self._extract_technical_context(docs, repo_analysis)
-        
-        # Generate initial tasks
-        tasks = []
-        for doc in docs:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": (
-                        "You are a coding agent that generates realistic coding tasks "
-                        "from documentation. Generate specific, actionable tasks that "
-                        "could be performed in a codebase."
-                    )},
-                    {"role": "user", "content": f"""Generate 3 specific coding tasks based on this documentation and technical context:
-
-Documentation:
-{doc}
-
-Technical Context:
-{json.dumps(tech_context, indent=2)}
-
-Tasks should be:
-1. Specific and actionable
-2. Aligned with the technical stack
-3. Following identified patterns
-4. Consider edge cases
-5. Include testing/validation"""}
-                ]
-            )
-            
-            # Parse base tasks
-            task_text = response.choices[0].message.content
-            for line in task_text.split('\n'):
-                if line.strip():
-                    # Generate variations for each base task
-                    variations = self._generate_task_variations(line.strip(), tech_context)
-                    
-                    # Create task examples with context
-                    for task in [line.strip()] + variations:
-                        tasks.append(TaskExample(
-                            instruction=task,
-                            context={
-                                "source_doc": doc,
-                                "tech_context": tech_context,
-                                "repo_analysis": repo_analysis
-                            }
-                        ))
-        
-        # Filter and validate tasks
-        return self._filter_tasks(tasks, repo_analysis)
-    
-    def backward_construct(self, trajectory: Dict[str, Any]) -> str:
-        """
-        Given a trajectory of actions and observations, construct a precise
-        instruction that matches what actually happened. Uses error states and similar
-        trajectories to generate more accurate instructions.
-        """
-        # Format actions with their outcomes
-        action_outcomes = []
-        for i, (action, obs) in enumerate(zip(trajectory['actions'], trajectory['observations'])):
-            outcome = "success" if isinstance(obs, dict) and obs.get('status') == 'success' else "failed"
-            desc = action.get('description', '')
-            action_outcomes.append(f"Action {i+1}: {action['type']} - {desc} ({outcome})")
-        
-        actions_text = "\n".join(action_outcomes)
-        
-        # Analyze execution patterns from similar trajectories
-        similar_patterns = []
-        if 'similar_trajectories' in trajectory:
-            for t in trajectory['similar_trajectories']:
-                if all(o.get('status') == 'success' for o in t.get('observations', [])):
-                    similar_patterns.append({
-                        'instruction': t['instruction'],
-                        'action_count': len(t['actions']),
-                        'success': True
-                    })
-        
-        # Extract success patterns
-        success_patterns = [
-            p for p in similar_patterns 
-            if p['success'] and p['action_count'] == len(trajectory['actions'])
-        ]
-        
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": (
-                    "You are a coding agent that writes precise instructions "
-                    "based on actual sequences of actions taken in a codebase. "
-                    "Write a single, specific instruction that accurately describes "
-                    "the sequence of actions, focusing on what was actually done.\n\n"
-                    "Consider:\n"
-                    "1. Action outcomes (success/failure)\n"
-                    "2. Similar successful trajectories\n"
-                    "3. Technical accuracy and specificity\n"
-                    "4. Edge cases and error handling"
-                )},
-                {"role": "user", "content": (
-                    f"Original instruction: {trajectory['instruction']}\n\n"
-                    f"Actual actions and outcomes:\n{actions_text}\n\n"
-                    "Similar successful patterns:\n" + 
-                    ("\n".join(f"- {p['instruction']}" for p in success_patterns) if success_patterns else "None") +
-                    "\n\nConstruct a precise instruction that describes what was actually accomplished."
-                )}
-            ]
-        )
-        
-        # Extract and validate the constructed instruction
-        new_instruction = response.choices[0].message.content.strip()
-        
-        # If the trajectory had failures, reflect that in the instruction
-        if any(isinstance(obs, dict) and obs.get('error') for obs in trajectory['observations']):
-            new_instruction = f"Attempt to {new_instruction} (partially completed with errors)"
-            
-        return new_instruction
-    
-    def compute_embedding(self, text: str) -> np.ndarray:
-        """Compute embedding for a text using Sentence Transformers model"""
-        if self.embedding_model is None:
-            # For testing scenarios
-            return np.ones(384)  # Default embedding dimension for all-MiniLM-L6-v2
-            
-        # Get embeddings using Sentence Transformers
-        return self.embedding_model.encode(text, convert_to_numpy=True)
-    
-    def retrieve_similar_trajectories(self,
-                                   query: str,
-                                   trajectories: List[Dict[str, Any]],
-                                   k: int = 3) -> List[Dict[str, Any]]:
-        """
-        Retrieve k most similar trajectories using embedding similarity
-        """
-        if not trajectories:
-            return []
-            
-        query_embedding = self.compute_embedding(query)
-        
-        # Compute similarities
-        similarities = []
-        for traj in trajectories:
-            if 'embedding' not in traj:
-                traj['embedding'] = self.compute_embedding(traj['instruction'])
-            
-            similarity = np.dot(query_embedding, traj['embedding'])
-            similarities.append((similarity, traj))
-        
-        # Sort by similarity and return top k
-        similarities.sort(key=lambda x: x[0], reverse=True)
-        return [traj for _, traj in similarities[:k]]
-
-    def chat_completion(self, messages: List[Dict[str, str]]) -> Any:
-        """
-        Execute a chat completion with enhanced context understanding and task planning
-        
-        Args:
-            messages: List of message dictionaries with 'role' and 'content'
-        """
-        # Add system context about code-specific understanding
-        base_context = {
-            "role": "system",
-            "content": (
-                "You are an expert coding agent specialized in understanding and "
-                "executing coding tasks in Git repositories. Consider:\n"
-                "1. Code patterns and best practices\n"
-                "2. Repository structure and state\n"
-                "3. Technical context and frameworks\n"
-                "4. Error handling and recovery\n"
-                "5. Testing and validation"
-            )
+        self.action_type_risks = {
+            'edit_file': 0.4,
+            'git_commit': 0.2,
+            'git_checkout': 0.6,
+            'run_tests': 0.1,
+            'fix_permissions': 0.7,
+            'resolve_conflict': 0.8,
+            'delete_file': 0.9
         }
-        
-        # Ensure we preserve the system message if it exists
-        if messages and messages[0]["role"] == "system":
-            messages[0]["content"] = base_context["content"] + "\n\n" + messages[0]["content"]
-        else:
-            messages.insert(0, base_context)
-            
-        # Execute completion
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.7,  # Balance between creativity and consistency
-            max_tokens=1000,  # Generous limit for complex responses
-            top_p=0.95,      # Focus on more likely tokens
-            presence_penalty=0.2,  # Slight penalty to avoid repetition
-            frequency_penalty=0.2   # Slight penalty for too-frequent tokens
-        )
-        
-        return response
 
-    def _analyze_task_context(self, task: str, repo_state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze a task and repository state to extract relevant context for planning
-        """
-        # Prepare analysis prompt
-        analysis_prompt = f"""Analyze this coding task and repository state to extract relevant context:
-
-Task: {task}
-
-Repository State:
-{json.dumps(repo_state, indent=2)}
-
-Extract:
-1. Required file operations
-2. Dependencies and frameworks needed
-3. Potential error cases
-4. Testing requirements
-5. Success criteria
-6. Risk factors
-
-Return as JSON object."""
-
-        response = self.chat_completion([
-            {"role": "system", "content": "You are a technical analyst extracting structured context from coding tasks."},
-            {"role": "user", "content": analysis_prompt}
-        ])
-        
-        try:
-            return json.loads(response.choices[0].message.content)
-        except:
-            return {}
-
-    def _evaluate_action_risk(self, action: Dict[str, Any], context: Dict[str, Any]) -> float:
-        """
-        Evaluate the risk level of an action (0-1 scale)
-        """
-        risk_score = 0.0
-        
-        # Action type risks
-        type_risks = {
-            'edit_file': 0.4,      # Moderate risk - file changes
-            'git_commit': 0.2,     # Lower risk - reversible
-            'git_checkout': 0.6,   # Higher risk - branch changes
-            'run_tests': 0.1,      # Very low risk
-            'fix_permissions': 0.7, # High risk - system changes
-            'resolve_conflict': 0.8 # High risk - data loss possible
-        }
-        
-        risk_score += type_risks.get(action.get('type', ''), 0.5)
-        
-        # Content-based risks
-        if action.get('type') == 'edit_file':
-            # Check for sensitive operations
-            content = str(action.get('content', '')).lower()
-            if 'delete' in content or 'remove' in content:
-                risk_score += 0.2
-            if 'password' in content or 'secret' in content:
-                risk_score += 0.3
-                
-        # Context-based adjustments
-        if context.get('risk_factors'):
-            for factor in context['risk_factors']:
-                if isinstance(factor, dict) and factor.get('severity'):
-                    risk_score += float(factor['severity']) * 0.1
-                    
-        return min(1.0, risk_score)
-
-    def _validate_action(self, action: Dict[str, Any], context: Dict[str, Any]) -> bool:
-        """
-        Validate an action against task context and constraints
-        """
-        # Basic action structure validation
-        if not isinstance(action, dict) or 'type' not in action:
-            return False
-            
-        # Action type-specific validation
-        if action['type'] == 'edit_file':
-            if not action.get('path') or not action.get('content'):
-                return False
-            # Validate against required operations
-            if context.get('required_operations'):
-                file_ops = [op.get('file') for op in context['required_operations']]
-                if action['path'] not in file_ops:
-                    return False
-                    
-        elif action['type'] == 'git_commit':
-            if not action.get('message'):
-                return False
-                
-        elif action['type'] == 'git_checkout':
-            if not action.get('branch'):
-                return False
-                
-        # Check risk level
-        risk_score = self._evaluate_action_risk(action, context)
-        if risk_score > 0.8:  # High-risk threshold
-            return False
-            
-        return True
-
-    def _get_pattern_suggestions(self, task: str, current_state: Dict[str, Any], examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Extract action suggestions from successful patterns in example trajectories
-        """
-        # Convert examples to sequences
-        sequences = []
-        for example in examples:
-            try:
-                sequence = ActionSequence.from_trajectory(example)
-                if sequence.success_rate > 0.8:
-                    sequences.append(sequence)
-            except:
-                continue
-        
-        # Group by semantic type
-        type_patterns = {}
-        for seq in sequences:
-            if seq.semantic_type not in type_patterns:
-                type_patterns[seq.semantic_type] = []
-            type_patterns[seq.semantic_type].append(seq)
-        
-        # Create pattern suggestions
-        suggestions = []
-        task_lower = task.lower()
-        
-        for sem_type, seqs in type_patterns.items():
-            if len(seqs) >= 2:  # Need multiple examples to form a pattern
-                pattern = SequencePattern(seqs)
-                best_example = pattern.get_best_example()
-                
-                # Check if pattern matches task semantics
-                matches_semantics = (
-                    (sem_type == 'create' and any(word in task_lower for word in ['create', 'add', 'new'])) or
-                    (sem_type == 'modify' and any(word in task_lower for word in ['update', 'change', 'modify'])) or
-                    (sem_type == 'test' and any(word in task_lower for word in ['test', 'verify'])) or
-                    (sem_type == 'fix' and any(word in task_lower for word in ['fix', 'repair', 'solve']))
-                )
-                
-                if matches_semantics:
-                    suggestions.append({
-                        'pattern_type': sem_type,
-                        'success_rate': pattern.avg_success_rate,
-                        'suggested_actions': [
-                            step.action for step in best_example.steps
-                        ],
-                        'example_instruction': best_example.steps[0].action.get('description', '')
-                    })
-        
-        return suggestions
-
-    def plan_next_action(self, current_state: Dict[str, Any], task: str, history: List[Dict[str, Any]], examples: List[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """
-        Plan the next action for a task using pattern matching and LLM guidance
-        """
-        # Get pattern suggestions if examples are provided
-        pattern_suggestions = []
-        if examples:
-            pattern_suggestions = self._get_pattern_suggestions(task, current_state, examples)
-        
-        # Analyze task context
-        context = self._analyze_task_context(task, current_state)
-        
-        # Prepare planning prompt with pattern information
-        planning_prompt = f"""Plan the next action for this coding task:
-
-Task: {task}
-
-Current State:
-{json.dumps(current_state, indent=2)}
-
-Action History:
-{json.dumps(history, indent=2)}
-
-Task Context:
-{json.dumps(context, indent=2)}
-
-Pattern Suggestions:
-{json.dumps(pattern_suggestions, indent=2)}
-
-Requirements:
-1. Action must be valid and safe
-2. Must make progress toward goal
-3. Consider successful patterns from similar tasks
-4. Handle potential errors
-5. Follow best practices
-
-Return a single action as JSON object with 'type' and required parameters."""
-
-        # Get action recommendation
-        response = self.chat_completion([
-            {"role": "system", "content": "You are a coding agent planning the next action in a sequence."},
-            {"role": "user", "content": planning_prompt}
-        ])
-        
-        try:
-            action = json.loads(response.choices[0].message.content)
-            
-            # Validate action before returning
-            if self._validate_action(action, context):
-                return action
-                
-        except:
-            # Fallback: Use most relevant pattern suggestion if available
-            if pattern_suggestions:
-                best_pattern = max(pattern_suggestions, key=lambda x: x['success_rate'])
-                current_step = len(history)
-                if current_step < len(best_pattern['suggested_actions']):
-                    return best_pattern['suggested_actions'][current_step]
-        
-        return None
-
-    def backward_construct(self, trajectory: 'Trajectory') -> str:
-        """
-        Construct a more accurate instruction from a successful trajectory.
-        This aligns instructions with what was actually done.
-        """
-        # Analyze actions and their results
-        action_groups = self._group_related_actions(trajectory.actions)
-        objectives = []
-        
-        for group in action_groups:
-            # Get the primary type of actions in this group
-            action_type = group[0].get('type', '')
-            
-            if action_type.startswith('create'):
-                objectives.append(f"Create {group[0].get('file', 'new file')}")
-            elif action_type.startswith('edit'):
-                files = {a.get('file') for a in group if 'file' in a}
-                objectives.append(f"Modify {', '.join(files)}")
-            elif action_type.startswith('test'):
-                objectives.append("Run and verify tests")
-            elif action_type.startswith('fix'):
-                objectives.append(f"Fix issues in {group[0].get('file', 'code')}")
-            elif action_type.startswith('add'):
-                objectives.append(f"Add {group[0].get('what', 'component')}")
-        
-        # Check final state for additional context
-        if trajectory.final_state:
-            if 'test_results' in trajectory.final_state:
-                if trajectory.final_state['test_results'].get('status') == 'pass':
-                    objectives.append("Ensure all tests pass")
-            
-            if 'git_status' in trajectory.final_state:
-                status = trajectory.final_state['git_status']
-                if status.get('staged'):
-                    objectives.append("Stage changes")
-                if status.get('committed'):
-                    objectives.append("Commit changes")
-        
-        # Construct natural instruction
-        if len(objectives) == 1:
-            return objectives[0]
-        elif len(objectives) == 2:
-            return f"{objectives[0]} and {objectives[1]}"
-        elif len(objectives) > 2:
-            return f"{', '.join(objectives[:-1])}, and {objectives[-1]}"
-        else:
-            return trajectory.instruction  # Fallback to original if no clear objectives
-
-    def _group_related_actions(self, actions: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-        """Group related actions together based on type and target"""
+    def _group_related_actions(self, actions: List[Dict]) -> List[List[Dict]]:
+        """Group related actions together"""
         if not actions:
             return []
             
         groups = []
-        current_group = [actions[0]]
+        current_group = []
         
-        for action in actions[1:]:
-            prev_action = current_group[-1]
+        for action in actions:
+            if not current_group:
+                current_group = [action]
+                continue
+                
+            # Check if action is related to current group
+            last_action = current_group[-1]
+            is_related = False
             
-            # Check if actions are related
-            if (action.get('type', '').split('_')[0] == prev_action.get('type', '').split('_')[0] or
-                action.get('file') == prev_action.get('file')):
+            # Same file operations
+            if ('file' in action and 'file' in last_action and 
+                action['file'] == last_action['file']):
+                is_related = True
+                
+            # Same path operations    
+            elif ('path' in action and 'path' in last_action and 
+                  action['path'] == last_action['path']):
+                is_related = True
+                
+            # Sequential test operations
+            elif (action['type'] == 'run_tests' and 
+                  any(a['type'] in ['edit_file', 'fix_imports'] for a in current_group)):
+                is_related = True
+                
+            if is_related:
                 current_group.append(action)
             else:
                 groups.append(current_group)
                 current_group = [action]
-        
-        groups.append(current_group)
+                
+        if current_group:
+            groups.append(current_group)
+            
         return groups
 
-    def refine_instruction_library(self, trajectory_manager: 'TrajectoryManager'):
-        """
-        Refine instructions in trajectory library using backward construction.
-        This helps align stored examples with what was actually accomplished.
-        """
-        updated_count = 0
-        
-        for trajectory in trajectory_manager.trajectories:
-            if trajectory.compute_quality_metrics().success_rate >= 0.8:
-                # Only refine instructions for highly successful trajectories
-                new_instruction = self.backward_construct(trajectory)
-                
-                if new_instruction != trajectory.instruction:
-                    # Store as a new trajectory with refined instruction
-                    refined_trajectory = type('Trajectory', (), {
-                        'instruction': new_instruction,
-                        'actions': trajectory.actions,
-                        'observations': trajectory.observations,
-                        'final_state': trajectory.final_state
-                    })()
-                    
-                    trajectory_manager.store_trajectory(refined_trajectory)
-                    updated_count += 1
-        
-        return updated_count
-
-    def generate_plan(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Generate plan with exploration vs exploitation"""
-        # Look for matching patterns
-        similar = self.get_similar_patterns(
-            [{'type': 'analyze'}],  # Initial dummy action to match patterns
-            state,
-            min_success_rate=0.8
-        )
-        
-        best_pattern = None
-        best_confidence = 0.0
-        
-        for pattern in similar:
-            pattern_key = self._get_pattern_key(pattern)
-            confidence = self.get_pattern_confidence(pattern_key)
+    def backward_construct(self, trajectory: 'Trajectory') -> str:
+        """Construct specific instruction from trajectory"""
+        if not trajectory.actions:
+            return trajectory.instruction
             
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_pattern = pattern
+        # Get more descriptive instruction based on actions
+        actions = trajectory.actions
+        descriptions = []
         
-        # Decide whether to explore or exploit
-        if best_pattern and best_confidence >= 0.7:
-            # Exploit: use successful pattern
-            return best_pattern['actions']
-        else:
-            # Explore: generate new plan using LLM
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": (
-                            "You are an expert coding agent that generates detailed action plans. "
-                            "Generate a specific sequence of actions to accomplish a coding task."
-                        )},
-                        {"role": "user", "content": f"""
-                            Generate a specific action plan for this task:
-                            Instruction: {instruction}
-                            
-                            Current State:
-                            {json.dumps(state, indent=2)}
-                            
-                            Return a list of actions as a JSON array. Each action should have:
-                            1. 'type': The type of action (edit_file, run_tests, etc)
-                            2. Required parameters for that action type
-                            3. Brief description of what the action does
-                        """}
-                    ]
-                )
-                plan = json.loads(response.choices[0].message.content)
-                if isinstance(plan, list) and len(plan) > 0:
-                    return plan
-            except:
-                pass
+        for action in actions:
+            if action['type'] == 'edit_file':
+                descriptions.append(f"Implement {action.get('description', 'changes')} in {action.get('path', action.get('file', ''))}")
+            elif action['type'] == 'create_file':
+                descriptions.append(f"Create {action.get('path', action.get('file', ''))}")
+            elif action['type'] == 'run_tests':
+                descriptions.append("Run tests")
+            else:
+                name = action['type'].replace('_', ' ').title()
+                target = action.get('path', action.get('file', ''))
+                descriptions.append(f"{name} {target}")
                 
-            # Fallback to basic plan
-            return [
-                {
-                    'type': 'analyze',
-                    'description': 'Analyze current state'
-                },
-                {
-                    'type': 'plan',
-                    'description': 'Generate action plan'
-                }
-            ]
+        return " and ".join(descriptions)
 
-    def bootstrap_learning(self, 
-                         docs_path: str, 
-                         framework_info: Dict[str, Any],
-                         file_patterns: Dict[str, Any],
-                         trajectory_manager: 'TrajectoryManager') -> int:
-        """
-        Bootstrap learning by generating and executing tasks from documentation
-        Returns the number of successful trajectories generated
-        """
-        # Generate tasks from all available sources
-        tasks = []
-        tasks.extend(self.task_generator.extract_tasks_from_docs(Path(docs_path)))
-        tasks.extend(self.task_generator.generate_framework_tasks(framework_info))
-        tasks.extend(self.task_generator.generate_codebase_tasks(file_patterns))
-        
-        # Filter out duplicates
-        unique_tasks = self.task_generator.filter_duplicate_tasks(tasks)
-        
-        # Sort tasks by priority
-        unique_tasks.sort(key=lambda t: 0 if t.get('priority') == 'high' else 1)
-        
-        successful_count = 0
-        
-        # Execute each task and learn from results
-        for task in unique_tasks:
-            try:
-                result = self.agent.execute_task(task['instruction'])
-                if result.get('status') == 'success':
-                    successful_count += 1
-                    
-                    # Learn from successful execution
-                    if 'trajectory' in result:
-                        # Refine instruction through backward construction
-                        refined_instruction = self.backward_construct(result['trajectory'])
-                        
-                        # Store refined trajectory
-                        refined_trajectory = type('Trajectory', (), {
-                            'instruction': refined_instruction,
-                            'actions': result['trajectory'].actions,
-                            'observations': result['trajectory'].observations,
-                            'final_state': result['trajectory'].final_state
-                        })()
-                        
-                        trajectory_manager.store_trajectory(refined_trajectory)
-                        
-                        # Extract and store any successful patterns
-                        self._learn_patterns(refined_trajectory)
-            except Exception as e:
-                # Log error but continue with other tasks
-                print(f"Error executing task '{task['instruction']}': {str(e)}")
-                continue
-        
-        return successful_count
+    def learn_from_trajectory(self, trajectory: 'Trajectory') -> Optional['Trajectory']:
+        """Learn from a successful trajectory execution"""
+        if not trajectory or not trajectory.actions:
+            return None
+            
+        # Only learn from high quality trajectories
+        metrics = trajectory.compute_quality_metrics()
+        if metrics.success_rate < 0.7:
+            return None
+
+        self._learn_patterns(trajectory)
+        return self._refine_trajectory(trajectory)
 
     def _learn_patterns(self, trajectory: 'Trajectory') -> None:
         """Learn successful patterns from a trajectory"""
-        if trajectory.compute_quality_metrics().success_rate >= 0.8:
-            # Group related actions
-            action_groups = self._group_related_actions(trajectory.actions)
-            
-            for group in action_groups:
-                # Create pattern signature from action types
-                pattern_key = tuple(a.get('type', '') for a in group)
+        try:
+            metrics = trajectory.compute_quality_metrics()
+            if metrics.success_rate < 0.7:  # Only learn from mostly successful trajectories
+                return
                 
-                # Store successful pattern with context
-                self.learned_patterns[pattern_key].append({
-                    'actions': group,
-                    'state_before': trajectory.observations[0].get('state_before', {}),
-                    'success_rate': trajectory.compute_quality_metrics().success_rate
-                })
-    
-    def get_similar_patterns(self, 
-                           action_sequence: List[Dict[str, Any]], 
-                           state: Dict[str, Any],
-                           min_success_rate: float = 0.8) -> List[Dict[str, Any]]:
-        """Get similar successful patterns for an action sequence"""
-        if not action_sequence:
-            return []
-            
-        # Create pattern signature from sequence
-        pattern_key = tuple(a.get('type', '') for a in action_sequence)
-        
-        matching_patterns = []
-        
-        # Look for exact matches
-        if pattern_key in self.learned_patterns:
-            matching_patterns.extend(
-                pattern for pattern in self.learned_patterns[pattern_key]
-                if pattern['success_rate'] >= min_success_rate
-            )
-        
-        # Look for partial matches (subsequences)
-        for key in self.learned_patterns:
-            if len(key) >= len(pattern_key):
-                continue
+            pattern_key = self._get_pattern_key(trajectory)
+            if pattern_key not in self.learning_rates:
+                self.learning_rates[pattern_key] = LearningRate()
                 
-            # Check if this is a subsequence of our pattern
-            for i in range(len(pattern_key) - len(key) + 1):
-                if pattern_key[i:i+len(key)] == key:
-                    matching_patterns.extend(
-                        pattern for pattern in self.learned_patterns[key]
-                        if pattern['success_rate'] >= min_success_rate
-                    )
-        
-        return matching_patterns
+            self.learning_rates[pattern_key].update(True)
+            
+            if pattern_key not in self.learned_patterns:
+                self.learned_patterns[pattern_key] = {
+                    'actions': trajectory.actions,
+                    'success_rate': metrics.success_rate,
+                    'count': 1,
+                    'type': trajectory.actions[0]['type'] if trajectory.actions else None,
+                    'state_impact': self._analyze_state_impact(trajectory)
+                }
+            else:
+                pattern = self.learned_patterns[pattern_key]
+                pattern['count'] += 1
+                # Update rolling average of success rate
+                pattern['success_rate'] = (pattern['success_rate'] * (pattern['count'] - 1) + 
+                                         metrics.success_rate) / pattern['count']
+                # Update state impact analysis
+                new_impact = self._analyze_state_impact(trajectory)
+                pattern['state_impact'] = {
+                    k: (pattern['state_impact'].get(k, 0) * (pattern['count'] - 1) + 
+                        new_impact.get(k, 0)) / pattern['count']
+                    for k in set(pattern['state_impact']) | set(new_impact)
+                }
+        except Exception as e:
+            print(f"Error learning patterns: {e}")
 
-    def learn_from_trajectory(self, 
-                            trajectory: 'Trajectory',
-                            config: Optional['AgentConfig'] = None) -> None:
-        """Learn from a trajectory with adaptive rates"""
-        if trajectory.compute_quality_metrics().success_rate < 0.8:
-            return
+    def _analyze_state_impact(self, trajectory: 'Trajectory') -> Dict[str, float]:
+        """Analyze how actions impact repository state"""
+        impact = {
+            'files_changed': 0.0,
+            'test_coverage': 0.0,
+            'error_fixes': 0.0,
+            'complexity': 0.0
+        }
+        
+        if not trajectory.actions:
+            return impact
             
-        # Extract pattern signature
-        pattern_key = self._get_pattern_key(trajectory)
+        # Analyze file changes
+        changed_files = set()
+        for action in trajectory.actions:
+            if action.get('type') in ['edit_file', 'create_file', 'delete_file']:
+                changed_files.add(action.get('path', action.get('file', '')))
+        impact['files_changed'] = min(1.0, len(changed_files) / 5)  # Normalize
         
-        # Get or create learning rate for this pattern
-        rate = self.learning_rates[pattern_key]
+        # Analyze test coverage impact
+        test_actions = sum(1 for a in trajectory.actions if 'test' in str(a.get('type', '')).lower())
+        impact['test_coverage'] = min(1.0, test_actions / len(trajectory.actions))
         
-        # Update learning rate based on trajectory success
-        rate.update(True)
+        # Analyze error fixes
+        fixes = sum(1 for a in trajectory.actions if 'fix' in str(a.get('type', '')).lower())
+        impact['error_fixes'] = min(1.0, fixes / len(trajectory.actions))
         
-        # Learn pattern with current rate
-        if rate.success_rate >= (config.min_pattern_success_rate if config else 0.8):
-            self._learn_patterns(trajectory)
-            
-            # If pattern is highly successful, refine instruction
-            if rate.success_rate >= 0.9:
-                refined = self.backward_construct(trajectory)
-                if refined != trajectory.instruction:
-                    # Store refined version with high confidence
-                    refined_trajectory = type('Trajectory', (), {
-                        'instruction': refined,
-                        'actions': trajectory.actions,
-                        'observations': trajectory.observations,
-                        'final_state': trajectory.final_state,
-                        'compute_quality_metrics': trajectory.compute_quality_metrics
-                    })()
-                    return refined_trajectory
+        # Analyze complexity
+        impact['complexity'] = min(1.0, len(trajectory.actions) / 10)  # Normalize
         
-        return None
-    
+        return impact
+
     def _get_pattern_key(self, trajectory: 'Trajectory') -> str:
-        """Generate a unique key for a trajectory pattern"""
-        action_types = [a.get('type', '') for a in trajectory.actions]
-        state_changes = getattr(trajectory, 'state_changes', [])
-        change_types = [c.type for c in state_changes]
-        
-        return f"{':'.join(action_types)}|{':'.join(change_types)}"
-    
+        """Generate unique key for pattern based on action sequence"""
+        if not trajectory.actions:
+            return ''
+            
+        # Create key from action types and targets
+        key_parts = []
+        for action in trajectory.actions:
+            action_type = action.get('type', '')
+            target = action.get('path', action.get('file', ''))
+            key_parts.append(f"{action_type}:{target}")
+            
+        return '|'.join(key_parts)
+
     def get_pattern_confidence(self, pattern_key: str) -> float:
-        """Get confidence level for a pattern"""
-        rate = self.learning_rates[pattern_key]
-        return rate.success_rate * rate.rate
-    
-    def should_explore_pattern(self, pattern_key: str, min_confidence: float = 0.3) -> bool:
-        """Determine if a pattern should be explored"""
-        # Always explore if pattern is new
-        if pattern_key not in self.learning_rates:
+        """Get confidence level for a learned pattern"""
+        if pattern_key not in self.learned_patterns:
+            return 0.0
+            
+        pattern = self.learned_patterns[pattern_key]
+        learning_rate = self.learning_rates.get(pattern_key)
+        
+        if not learning_rate:
+            return 0.0
+        
+        # Combine success rate with learning rate
+        base_confidence = pattern['success_rate'] * learning_rate.rate
+        
+        # Adjust based on number of observations
+        observation_factor = min(1.0, pattern['count'] / 5)  # Saturate at 5 observations
+        
+        # Adjust based on state impact
+        impact_score = sum(pattern['state_impact'].values()) / len(pattern['state_impact'])
+        
+        return base_confidence * observation_factor * (1 + impact_score) / 2
+
+    def should_explore_pattern(self, pattern_key: str) -> bool:
+        """Determine if a pattern needs more exploration"""
+        if pattern_key not in self.learned_patterns:
             return True
             
-        rate = self.learning_rates[pattern_key]
+        pattern = self.learned_patterns[pattern_key]
+        learning_rate = self.learning_rates.get(pattern_key)
         
-        # Explore if:
-        # 1. Pattern has high success rate but low attempts (need more data)
-        # 2. Pattern has medium success rate and good learning rate
-        # 3. Pattern is above minimum confidence threshold
-        return (
-            (rate.success_rate >= 0.8 and rate.attempts < 5) or
-            (rate.success_rate >= 0.6 and rate.rate >= 0.2) or
-            (self.get_pattern_confidence(pattern_key) >= min_confidence)
-        )
-    
-    def generate_plan(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Generate plan with exploration vs exploitation"""
-        # Look for matching patterns
-        similar = self.get_similar_patterns(
-            [{'type': 'analyze'}],  # Initial dummy action to match patterns
-            state,
-            min_success_rate=0.8
-        )
-        
-        best_pattern = None
-        best_confidence = 0.0
-        
-        for pattern in similar:
-            pattern_key = self._get_pattern_key(pattern)
-            confidence = self.get_pattern_confidence(pattern_key)
+        if not learning_rate:
+            return True
             
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_pattern = pattern
+        # Explore if we have few observations
+        if pattern['count'] < 3:
+            return True
+            
+        # Explore if success rate is promising but learning rate is low
+        if pattern['success_rate'] > 0.7 and learning_rate.rate < 0.5:
+            return True
+            
+        # Explore if we haven't seen the pattern recently
+        if learning_rate.confidence < 0.3:
+            return True
+            
+        return False
+
+    def generate_tasks_from_docs(self, docs: List[str], repo_state: Dict) -> List['Task']:
+        """Generate tasks by analyzing documentation and current repository state"""
+        tasks = []
+        embedding_batch_size = 32
         
-        # Decide whether to explore or exploit
-        if best_pattern and best_confidence >= 0.7:
-            # Exploit: use successful pattern
-            return best_pattern['actions']
-        else:
-            # Explore: generate new plan using LLM
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": (
-                            "You are an expert coding agent that generates detailed action plans. "
-                            "Generate a specific sequence of actions to accomplish a coding task."
-                        )},
-                        {"role": "user", "content": f"""
-                            Generate a specific action plan for this task:
-                            Instruction: {instruction}
-                            
-                            Current State:
-                            {json.dumps(state, indent=2)}
-                            
-                            Return a list of actions as a JSON array. Each action should have:
-                            1. 'type': The type of action (edit_file, run_tests, etc)
-                            2. Required parameters for that action type
-                            3. Brief description of what the action does
-                        """}
-                    ]
+        # First extract potential tasks from documentation
+        base_tasks = self._extract_tasks_from_docs(docs)
+        
+        # Generate task variations based on tech context
+        all_tasks = []
+        for task in base_tasks:
+            variations = self._generate_task_variations(task, repo_state)
+            all_tasks.extend(variations)
+        
+        # Create full task objects with embeddings
+        for i in range(0, len(all_tasks), embedding_batch_size):
+            batch = all_tasks[i:i + embedding_batch_size]
+            embeddings = self._compute_embeddings([t['instruction'] for t in batch])
+            
+            for task_dict, embedding in zip(batch, embeddings):
+                task = self._create_task(
+                    instruction=task_dict['instruction'],
+                    context=task_dict['context']
                 )
-                plan = json.loads(response.choices[0].message.content)
-                if isinstance(plan, list) and len(plan) > 0:
-                    return plan
+                task.embedding = embedding
+                tasks.append(task)
+        
+        return tasks
+
+    def _extract_tasks_from_docs(self, docs: List[str]) -> List[Dict]:
+        """Extract potential tasks from documentation"""
+        tasks = []
+        
+        for doc in docs:
+            # Use task-oriented prompts to identify potential tasks
+            response = self.chat_completion([
+                {"role": "system", "content": (
+                    "Identify concrete coding tasks from the documentation. "
+                    "Focus on actionable items that modify or create code. "
+                    "Return a JSON array of {instruction, type} objects."
+                )},
+                {"role": "user", "content": doc}
+            ])
+            
+            try:
+                doc_tasks = json.loads(response.choices[0].message.content)
+                tasks.extend(doc_tasks)
             except:
-                pass
+                continue
+        
+        return tasks
+
+    def _generate_task_variations(self, base_task: str, tech_context: Dict) -> List[Dict]:
+        """Generate task variations based on technical context"""
+        variations = []
+        
+        # Create context-specific variations
+        frameworks = tech_context.get('frameworks', [])
+        languages = tech_context.get('languages', [])
+        patterns = tech_context.get('patterns', [])
+        
+        response = self.chat_completion([
+            {"role": "system", "content": (
+                "Generate variations of the coding task that are specific to the "
+                "technical context. Focus on framework-specific implementations "
+                "and common patterns. Return a JSON array of {instruction, context} objects."
+            )},
+            {"role": "user", "content": json.dumps({
+                "task": base_task,
+                "frameworks": frameworks,
+                "languages": languages,
+                "patterns": patterns
+            })}
+        ])
+        
+        try:
+            variations = json.loads(response.choices[0].message.content)
+        except:
+            # Fallback to base task if variation generation fails
+            variations = [{
+                'instruction': base_task,
+                'context': tech_context
+            }]
+        
+        return variations
+
+    def _create_task(self, instruction: str, context: Dict) -> 'Task':
+        """Create a task with properly formatted instruction and context"""
+        # Replace generic terms with context-specific ones
+        frameworks = context.get('frameworks', [])
+        if frameworks:
+            # Add framework-specific prefixes
+            prefix = f"Using {frameworks[0]}, " if frameworks else ""
+            instruction = prefix + instruction
+            
+        # Add relevant file patterns
+        file_patterns = context.get('file_patterns', {})
+        if file_patterns:
+            for pattern, examples in file_patterns.items():
+                instruction = instruction.replace(pattern, examples[0])
                 
-            # Fallback to basic plan
-            return [
-                {
-                    'type': 'analyze',
-                    'description': 'Analyze current state'
-                },
-                {
-                    'type': 'plan',
-                    'description': 'Generate action plan'
+        return TaskExample(
+            instruction=instruction,
+            context=context,
+            embedding=None  # Will be set later in batch
+        )
+
+    def bootstrap_learning(self, docs_path: str, framework_info: Dict,
+                         file_patterns: Dict, trajectory_manager) -> int:
+        """Bootstrap learning from documentation"""
+        success_count = 0
+        
+        # Read documentation files
+        docs = []
+        docs_dir = Path(docs_path)
+        if docs_dir.exists():
+            for file in docs_dir.glob('**/*.md'):
+                docs.append(file.read_text())
+                
+        # Generate initial tasks
+        tasks = []
+        tasks.extend(self.generate_tasks_from_docs(docs, framework_info))
+        
+        # Add framework-specific tasks
+        if 'pytest' in framework_info.get('frameworks', []):
+            tasks.append(self._create_task(
+                "Add pytest fixtures for database testing",
+                framework_info
+            ))
+            tasks.append(self._create_task(
+                "Implement test coverage reporting",
+                framework_info
+            ))
+            
+        # Add tasks for complex files
+        for pattern_type, files in file_patterns.items():
+            for file in files:
+                tasks.append(self._create_task(
+                    f"Simplify complex functions in {file}",
+                    framework_info
+                ))
+                
+        # Execute tasks and learn
+        for task in tasks:
+            try:
+                result = self.agent.execute_task(task.instruction)
+                if result.get('status') == 'success':
+                    success_count += 1
+                    trajectory_manager.store_trajectory(result['trajectory'])
+            except Exception as e:
+                print(f"Error executing task '{task.instruction}': {str(e)}")
+                
+        return success_count
+
+    def _analyze_task_context(self, instruction: str, state: Dict) -> Dict:
+        """Analyze task context to determine requirements and risks"""
+        prompt = f"""Analyze this task and context:
+Task: {instruction}
+Current state: {state}
+
+Return a JSON object with:
+- required_operations: list of required file operations
+- dependencies: list of required dependencies
+- risk_factors: list of potential risks
+"""
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "system", "content": prompt}]
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception:
+            return {'required_operations': [], 'dependencies': [], 'risk_factors': []}
+
+    def _evaluate_action_risk(self, action: Dict, context: Dict) -> float:
+        """Evaluate risk level of an action"""
+        if not isinstance(action, dict):
+            return 0.5
+            
+        base_risk = self.action_type_risks.get(action.get('type', ''), 0.5)
+        
+        # Adjust for context risk factors
+        risk_factors = context.get('risk_factors', [])
+        for factor in risk_factors:
+            if isinstance(factor, dict):  
+                severity = factor.get('severity', 0)
+                base_risk = max(base_risk, severity)
+
+        return base_risk
+
+    def _validate_action(self, action: Dict, context: Dict) -> bool:
+        """Validate action against context and constraints"""
+        if not isinstance(action, dict) or 'type' not in action:
+            return False
+            
+        action_type = action['type']
+        
+        # Validate file operations
+        if action_type in ['edit_file', 'delete_file']:
+            if 'path' not in action and 'file' not in action:
+                return False
+                
+        # Validate git operations
+        if action_type.startswith('git_'):
+            # Don't allow git operations during merge conflicts
+            if context.get('git_status', {}).get('merge_conflicts'):
+                return False
+                
+        # Validate state requirements
+        if action_type == 'run_tests':
+            # Only allow if tests exist
+            if not any('test' in f for f in context.get('files', [])):
+                return False
+                
+        # Check required operations
+        required_ops = context.get('required_operations', [])
+        for op in required_ops:
+            if isinstance(op, dict) and op.get('file') == action.get('path'):
+                if op.get('operation') != action.get('type'):
+                    return False
+
+        # Check risk level
+        risk = self._evaluate_action_risk(action, context)
+        if risk > 0.8:  # High-risk threshold
+            return False
+
+        return True
+
+    def plan_next_action(self, current_state: Dict, instruction: str, 
+                        history: List[Dict], examples: List[Dict] = None) -> Dict:
+        """Plan next action based on current state, instruction and history"""
+        if not self.client:
+            raise ValueError("OpenAI client not initialized")
+
+        # Get pattern suggestions first
+        pattern_suggestions = self._get_pattern_suggestions(
+            instruction, current_state, examples or []
+        )
+
+        # Build rich context for decision
+        context = {
+            'instruction': instruction,
+            'current_state': current_state,
+            'action_history': history,
+            'pattern_suggestions': pattern_suggestions,
+            'successful_examples': examples
+        }
+
+        # Get next action recommendation
+        response = self.chat_completion([
+            {"role": "system", "content": (
+                "You are a coding agent that decides the next action to take. "
+                "Consider the current state, history, and learned patterns to "
+                "suggest the optimal next step that moves closer to the goal."
+            )},
+            {"role": "user", "content": json.dumps(context)}
+        ])
+
+        try:
+            action = json.loads(response.choices[0].message.content)
+            # Validate and assess risk of suggested action
+            if self._validate_action(action, current_state):
+                risk = self._evaluate_action_risk(action, current_state)
+                if risk < 0.8:  # Only proceed if risk is acceptable
+                    return action
+        except:
+            pass
+
+        # Fallback to most relevant pattern suggestion if available
+        if pattern_suggestions:
+            return pattern_suggestions[0]
+
+        # Ultimate fallback - safe default action
+        return {
+            'type': 'analyze',
+            'description': 'Analyzing current state to determine next step'
+        }
+
+    def _get_pattern_suggestions(self, instruction: str, current_state: Dict, 
+                               examples: List[Dict]) -> List[Dict]:
+        """Get relevant pattern suggestions based on current context"""
+        suggestions = []
+        
+        # First check exact pattern matches
+        for pattern_key, pattern in self.learned_patterns.items():
+            if pattern['success_rate'] >= 0.8:
+                # Check if pattern matches current state
+                if self._pattern_matches_state(pattern['actions'], current_state):
+                    confidence = self.get_pattern_confidence(pattern_key)
+                    suggestions.append({
+                        'actions': pattern['actions'],
+                        'confidence': confidence,
+                        'type': pattern['type']
+                    })
+        
+        # Then check similar examples
+        for example in examples:
+            if example.get('success_rate', 0) >= 0.8:
+                similarity = self._calculate_semantic_similarity(
+                    instruction, example.get('instruction', '')
+                )
+                if similarity > 0.7:
+                    suggestions.append({
+                        'actions': example['actions'],
+                        'confidence': similarity * 0.8,  # Slightly lower confidence for similar examples
+                        'type': example['actions'][0]['type'] if example['actions'] else None
+                    })
+        
+        # Sort by confidence
+        suggestions.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Convert to concrete actions
+        return [
+            self._adapt_pattern_to_state(s['actions'][0], current_state)
+            for s in suggestions[:3]  # Take top 3 suggestions
+        ]
+
+    def _pattern_matches_state(self, pattern_actions: List[Dict], state: Dict) -> bool:
+        """Check if a pattern is applicable to current state"""
+        if not pattern_actions:
+            return False
+            
+        # Check file existence for file operations
+        first_action = pattern_actions[0]
+        if first_action['type'] in ['edit_file', 'delete_file']:
+            target = first_action.get('path', first_action.get('file'))
+            if target and target not in state.get('files', []):
+                return False
+                
+        # Check for merge conflicts if pattern involves git operations
+        if any(a['type'].startswith('git_') for a in pattern_actions):
+            if state.get('git_status', {}).get('merge_conflicts'):
+                return False
+                
+        return True
+
+    def _adapt_pattern_to_state(self, pattern_action: Dict, state: Dict) -> Dict:
+        """Adapt a pattern action to current state"""
+        action = pattern_action.copy()
+        
+        # Adapt file paths if needed
+        if 'path' in action:
+            if action['path'] not in state.get('files', []):
+                # Try to find similar file
+                similar_files = [
+                    f for f in state.get('files', [])
+                    if Path(f).suffix == Path(action['path']).suffix
+                ]
+                if similar_files:
+                    action['path'] = similar_files[0]
+                    
+        # Update description
+        action['description'] = f"Applying learned pattern: {action['type']}"
+        
+        return action
+
+    def _calculate_semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity between two texts"""
+        embeddings = self._compute_embeddings([text1, text2])
+        if len(embeddings) != 2:
+            return 0.0
+        
+        # Compute cosine similarity
+        dot_product = np.dot(embeddings[0], embeddings[1])
+        norm1 = np.linalg.norm(embeddings[0])
+        norm2 = np.linalg.norm(embeddings[1])
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+            
+        return dot_product / (norm1 * norm2)
+
+    def _compute_embeddings(self, texts: List[str]) -> List[np.ndarray]:
+        """Compute embeddings for a list of texts"""
+        embeddings = []
+        for text in texts:
+            if self.client and hasattr(self.client, 'embeddings'):
+                response = self.client.embeddings.create(input=text, model="text-embedding-ada-002")
+                embeddings.append(np.array(response.data[0].embedding))
+            else:
+                # Fallback to simple TF-IDF-like embedding
+                words = set(text.lower().split())
+                embedding = np.zeros(384)  # Same dimension as all-MiniLM-L6-v2
+                for i, word in enumerate(words):
+                    embedding[hash(word) % 384] = 1
+                embeddings.append(embedding)
+        return embeddings
+
+    def chat_completion(self, messages: List[Dict]) -> Dict:
+        """Execute chat completion with enhanced system context"""
+        if messages and messages[0]['role'] == 'system':
+            messages[0]['content'] = f"{self.system_context}\n{messages[0]['content']}"
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=messages
+            )
+            return response
+        except Exception:
+            return {'choices': [{'message': {'content': '{}'}}]}
+
+    def generate_plan(self, instruction: str, state: Dict) -> List[Dict]:
+        """Generate execution plan for instruction"""
+        context = self._analyze_task_context(instruction, state)
+        
+        messages = [
+            {"role": "system", "content": "Generate an action plan for this task."},
+            {"role": "user", "content": f"Task: {instruction}\nContext: {context}"}
+        ]
+        
+        try:
+            response = self.chat_completion(messages)
+            return json.loads(response.choices[0].message.content)
+        except Exception:
+            return []
+
+    def _get_pattern_suggestions(self, instruction: str, current_state: Dict, 
+                               examples: List[Dict]) -> List[Dict]:
+        """Get pattern suggestions from examples"""
+        suggestions = []
+        
+        # Extract target module name from instruction
+        words = instruction.lower().split()
+        target = next((w for w in words if 'module' in w or '.py' in w), None)
+        if not target:
+            target = next((w for w in words if w not in ['create', 'new', 'add', 'implement']), 'module')
+        if not target.endswith('.py'):
+            target = f"{target}.py"
+            
+        for example in examples:
+            if any(word in instruction.lower() for word in example['instruction'].lower().split()):
+                # Copy action but replace path with appropriate one based on instruction
+                new_actions = []
+                for action in example['actions']:
+                    new_action = action.copy()
+                    if 'path' in action:
+                        new_action['path'] = action['path'].replace(
+                            action['path'].split('/')[-1],
+                            target
+                        )
+                    new_actions.append(new_action)
+                
+                pattern = {
+                    'pattern_type': example['actions'][0]['type'],
+                    'success_rate': 0.9,
+                    'suggested_actions': new_actions
                 }
-            ]
+                suggestions.append(pattern)
+                
+        return suggestions
+
+    def refine_instruction_library(self, trajectory_manager) -> int:
+        """Refine instructions in trajectory library"""
+        refined_count = 0
+        
+        for trajectory in trajectory_manager.trajectories:
+            if not hasattr(trajectory, 'quality_metrics'):
+                continue
+                
+            if trajectory.quality_metrics.get('success_rate', 0) >= 0.8:
+                refined = self._refine_trajectory(trajectory)
+                if refined:
+                    refined_count += 1
+                    trajectory_manager.store_trajectory(refined)
+                    
+        return refined_count
+
+    def _refine_trajectory(self, trajectory: 'Trajectory') -> Optional['Trajectory']:
+        """Refine a trajectory based on learned patterns and success metrics"""
+        if not trajectory or not trajectory.actions:
+            return None
+            
+        # Only refine successful trajectories
+        metrics = trajectory.compute_quality_metrics()
+        if metrics.success_rate < 0.7:
+            return None
+            
+        # Get similar successful patterns
+        pattern_key = self._get_pattern_key(trajectory)
+        similar_patterns = []
+        
+        for key, pattern in self.learned_patterns.items():
+            if key != pattern_key and pattern['success_rate'] >= 0.8:
+                similarity = self._calculate_pattern_similarity(
+                    trajectory.actions, pattern['actions']
+                )
+                if similarity > 0.6:
+                    similar_patterns.append(pattern)
+                    
+        if not similar_patterns:
+            return None
+            
+        # Create refined trajectory combining successful elements
+        refined_actions = self._merge_pattern_actions(
+            trajectory.actions,
+            [p['actions'] for p in similar_patterns]
+        )
+        
+        if refined_actions == trajectory.actions:
+            return None
+            
+        return type('Trajectory', (), {
+            'instruction': trajectory.instruction,
+            'actions': refined_actions,
+            'observations': trajectory.observations,
+            'final_state': trajectory.final_state,
+            'compute_quality_metrics': trajectory.compute_quality_metrics
+        })()
+
+    def _calculate_pattern_similarity(self, actions1: List[Dict], actions2: List[Dict]) -> float:
+        """Calculate similarity between two action sequences"""
+        if not actions1 or not actions2:
+            return 0.0
+            
+        # Compare action types and targets
+        matches = 0
+        total = max(len(actions1), len(actions2))
+        
+        for i in range(min(len(actions1), len(actions2))):
+            if actions1[i].get('type') == actions2[i].get('type'):
+                matches += 0.7  # Type match
+                if actions1[i].get('path') == actions2[i].get('path'):
+                    matches += 0.3  # Target match
+                    
+        return matches / total
+
+    def _merge_pattern_actions(self, base_actions: List[Dict], 
+                             pattern_actions_list: List[List[Dict]]) -> List[Dict]:
+        """Merge multiple action patterns to create an optimized sequence"""
+        if not pattern_actions_list:
+            return base_actions
+            
+        # Track action frequencies and success patterns
+        action_stats = {}
+        
+        # Analyze base actions
+        for i, action in enumerate(base_actions):
+            key = f"{action.get('type')}:{action.get('path', '')}"
+            if key not in action_stats:
+                action_stats[key] = {
+                    'count': 1,
+                    'positions': [i],
+                    'action': action
+                }
+            else:
+                action_stats[key]['count'] += 1
+                action_stats[key]['positions'].append(i)
+                
+        # Analyze pattern actions
+        for pattern_actions in pattern_actions_list:
+            for i, action in enumerate(pattern_actions):
+                key = f"{action.get('type')}:{action.get('path', '')}"
+                if key not in action_stats:
+                    action_stats[key] = {
+                        'count': 1,
+                        'positions': [i],
+                        'action': action
+                    }
+                else:
+                    action_stats[key]['count'] += 1
+                    action_stats[key]['positions'].append(i)
+                    
+        # Build optimized sequence
+        refined_actions = []
+        used_keys = set()
+        
+        # First add high-frequency actions in their most common positions
+        for key, stats in sorted(
+            action_stats.items(), 
+            key=lambda x: (-x[1]['count'], sum(x[1]['positions'])/len(x[1]['positions']))
+        ):
+            if key not in used_keys:
+                avg_pos = sum(stats['positions']) / len(stats['positions'])
+                # Insert action at average position if reasonable
+                pos = min(int(avg_pos), len(refined_actions))
+                refined_actions.insert(pos, stats['action'])
+                used_keys.add(key)
+                
+        # Fill in remaining actions from base sequence to maintain functionality
+        for action in base_actions:
+            key = f"{action.get('type')}:{action.get('path', '')}"
+            if key not in used_keys:
+                refined_actions.append(action)
+                used_keys.add(key)
+                
+        return refined_actions

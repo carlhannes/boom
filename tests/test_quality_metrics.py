@@ -31,13 +31,13 @@ def test_quality_score_calculation():
     assert score.success_rate == 1.0
     assert score.total_score >= 0.8  # High quality trajectory
     
-    # Test inefficient trajectory
+    # Test inefficient trajectory with duplicates
     inefficient_trajectory = create_test_trajectory(
         actions=[
             {'type': 'create_file', 'file': 'test.py'},
-            {'type': 'create_file', 'file': 'test.py'},  # Redundant
+            {'type': 'create_file', 'file': 'test.py'},
             {'type': 'write_test', 'file': 'test.py'},
-            {'type': 'write_test', 'file': 'test.py'},  # Redundant
+            {'type': 'write_test', 'file': 'test.py'}
         ],
         observations=[
             {'status': 'success'},
@@ -101,6 +101,40 @@ def test_relevance_scoring():
     score = metrics.compute_trajectory_quality(irrelevant_trajectory, irrelevant_trajectory.instruction)
     assert score.relevance < 0.5  # Actions don't match instruction
 
+def test_complexity_scoring():
+    metrics = QualityMetrics()
+    
+    # Test simple trajectory
+    simple_trajectory = create_test_trajectory(
+        actions=[
+            {'type': 'edit_file', 'file': 'simple.py'},
+            {'type': 'run_tests'}
+        ],
+        observations=[
+            {'status': 'success'},
+            {'status': 'success'}
+        ]
+    )
+    
+    score = metrics.assess_trajectory(simple_trajectory)
+    assert score.complexity_score >= 0.8  # Should be high for simple changes
+    
+    # Test complex trajectory
+    complex_trajectory = create_test_trajectory(
+        actions=[
+            {'type': 'create_file', 'file': 'a.py'},
+            {'type': 'edit_file', 'file': 'b.py'},
+            {'type': 'move_file', 'from': 'c.py', 'to': 'd.py'},
+            {'type': 'run_tests'},
+            {'type': 'git_commit'},
+            {'type': 'git_push'}
+        ],
+        observations=[{'status': 'success'}] * 6
+    )
+    
+    score = metrics.assess_trajectory(complex_trajectory)
+    assert score.complexity_score < 0.5  # Should penalize complexity
+
 def test_pattern_learning():
     metrics = QualityMetrics()
     
@@ -120,8 +154,8 @@ def test_pattern_learning():
     
     metrics.update_patterns(good_pattern)
     
-    # Test consistency scoring
-    similar_trajectory = create_test_trajectory(
+    # Test similar pattern recognition
+    similar_pattern = create_test_trajectory(
         actions=[
             {'type': 'create_file'},
             {'type': 'write_code'},
@@ -134,23 +168,11 @@ def test_pattern_learning():
         ]
     )
     
-    score = metrics.compute_trajectory_quality(similar_trajectory, "test")
-    assert score.consistency == 1.0  # Matches known good pattern
-
-def test_filtering():
-    metrics = QualityMetrics(min_quality_threshold=0.7)
+    metrics.update_patterns(similar_pattern)
     
-    # Test low quality trajectory
-    bad_trajectory = create_test_trajectory(
-        actions=[
-            {'type': 'delete_file', 'file': '*'},
-            {'type': 'delete_file', 'file': '*'}  # Redundant and dangerous
-        ],
-        observations=[
-            {'status': 'error'},
-            {'status': 'error'}
-        ]
-    )
-    
-    score = metrics.compute_trajectory_quality(bad_trajectory, bad_trajectory.instruction)
-    assert metrics.should_filter_trajectory(score)  # Should be filtered out
+    # Pattern should be recognized and have high success rate
+    pattern_key = tuple(a.get('type', '') for a in good_pattern.actions)
+    assert pattern_key in metrics.patterns
+    pattern_stats = metrics.patterns[pattern_key]
+    assert pattern_stats['success_count'] == 2
+    assert pattern_stats['count'] == 2

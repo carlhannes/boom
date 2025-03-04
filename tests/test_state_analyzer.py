@@ -66,7 +66,7 @@ def test_pattern_tracking():
     assert len(similar) >= 3
     
     # Verify safe paths learning
-    assert 'test.py' in analyzer.safe_paths
+    assert analyzer.is_safe_path('test.py')
 
 def test_state_history():
     analyzer = StateChangeAnalyzer()
@@ -80,20 +80,61 @@ def test_state_history():
     
     for state in states:
         analyzer._update_history(state)
+        
+    # Test retrieving history window
+    recent = analyzer.get_recent_states(2)
+    assert len(recent) == 2
+    assert recent[-1] == states[-1]
+    assert recent[0] == states[-2]
     
-    # Verify history maintenance
-    assert len(analyzer.state_history) == len(states)
-    assert analyzer.state_history[-1] == states[-1]
+    # Test history limit
+    for i in range(100):  # Add many states
+        analyzer._update_history({'files': [f'file{i}.py']})
+    assert len(analyzer.state_history) <= analyzer.MAX_HISTORY_SIZE
 
 def test_pattern_similarity():
     analyzer = StateChangeAnalyzer()
     
-    pattern1 = (('file_modified', True), ('file_created', False))
-    pattern2 = (('file_modified', True), ('file_created', False))
-    pattern3 = (('file_deleted', True), ('file_moved', True))
+    # Create test patterns
+    pattern1 = [
+        StateChange('file_modified', 'test.py', {'old': 1}, {'new': 2}, 0.5),
+        StateChange('file_created', 'new.py', None, {'exists': True}, 0.3)
+    ]
     
-    # Test exact match
-    assert analyzer._pattern_similarity(pattern1, pattern2) == 1.0
+    pattern2 = [
+        StateChange('file_modified', 'test.py', {'old': 3}, {'new': 4}, 0.5),
+        StateChange('file_created', 'other.py', None, {'exists': True}, 0.3)
+    ]
     
-    # Test different patterns
-    assert analyzer._pattern_similarity(pattern1, pattern3) < 0.5
+    pattern3 = [
+        StateChange('file_deleted', 'old.py', {'exists': True}, None, 0.7),
+        StateChange('file_moved', 'src.py', {'path': 'old'}, {'path': 'new'}, 0.4)
+    ]
+    
+    # Test similarity calculations
+    assert analyzer._compute_pattern_similarity(pattern1, pattern2) > 0.7  # Similar patterns
+    assert analyzer._compute_pattern_similarity(pattern1, pattern3) < 0.3  # Different patterns
+    
+    # Test with empty patterns
+    assert analyzer._compute_pattern_similarity([], []) == 1.0
+    assert analyzer._compute_pattern_similarity(pattern1, []) == 0.0
+
+def test_impact_aggregation():
+    analyzer = StateChangeAnalyzer()
+    
+    # Create a set of changes
+    changes = [
+        StateChange('file_modified', 'core.py', {'hash': 'old'}, {'hash': 'new'}, 0.9),
+        StateChange('file_created', 'utils.py', None, {'exists': True}, 0.5),
+        StateChange('file_deleted', 'temp.py', {'exists': True}, None, 0.2)
+    ]
+    
+    # Test total impact calculation
+    total_impact = analyzer.compute_total_impact(changes)
+    assert 0 <= total_impact <= 1
+    
+    # High impact changes should have more weight
+    high_impact = [StateChange('file_modified', 'core.py', {}, {}, 0.9)]
+    low_impact = [StateChange('file_modified', 'test.log', {}, {}, 0.1)]
+    
+    assert analyzer.compute_total_impact(high_impact) > analyzer.compute_total_impact(low_impact)

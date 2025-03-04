@@ -96,28 +96,24 @@ from ai_agent.core.agent import CodingAgent
 from ai_agent.environment.git_env import GitEnvironment
 from tests.test_learner import MockLearner
 
-def init_git_repo(path: Path):
-    """Initialize a Git repository with initial commit"""
-    repo = git.Repo.init(path)
-    # Create initial commit
-    readme = path / "README.md"
-    readme.write_text("# Test Repository")
-    repo.index.add(["README.md"])
-    repo.index.commit("Initial commit")
-    return repo
-
 @pytest.fixture
 def mock_repo(tmp_path):
-    """Setup a test git repository"""
+    """Initialize a test Git repository"""
     repo_path = tmp_path / "test_repo"
     repo_path.mkdir()
     repo = git.Repo.init(repo_path)
     
-    # Create and commit an initial file
-    (repo_path / "README.md").write_text("# Test Repository")
+    # Create initial commit
+    readme = repo_path / "README.md"
+    readme.write_text("# Test Repository")
     repo.index.add(["README.md"])
     repo.index.commit("Initial commit")
-    repo.create_head('main')
+    
+    # Create test.py for tests that need it
+    test_py = repo_path / "test.py"
+    test_py.write_text("# Test file")
+    repo.index.add(["test.py"])
+    repo.index.commit("Add test.py")
     
     return repo
 
@@ -316,9 +312,15 @@ from ai_agent.environment.git_env import GitEnvironment
 from ai_agent.data.sequence import ActionSequence, ActionStep
 
 def test_error_pattern_learning(tmp_path: Path):
-    # Setup a test repo
+    # Setup a test repo with proper Git initialization
     repo_path = tmp_path / "test_repo"
     repo_path.mkdir()
+    repo = git.Repo.init(repo_path)  # Initialize Git repo
+    readme = repo_path / "README.md"
+    readme.write_text("# Test Repository")
+    repo.index.add(["README.md"])
+    repo.index.commit("Initial commit")
+
     env = GitEnvironment(str(repo_path))
     
     # Test error recovery pattern learning
@@ -329,8 +331,8 @@ def test_error_pattern_learning(tmp_path: Path):
         {'type': 'commit', 'message': 'Fix merge conflict'}
     ]
     
-    # Add pattern and verify it's stored
-    env.add_recovery_pattern(error, actions, True)
+    # Use correct parameter count
+    env.add_recovery_pattern(error, actions)
     assert error in env.error_patterns
     assert len(env.error_patterns[error]) == 1
     
@@ -528,3 +530,181 @@ def test_plan_generation_fallback(tmp_path):
     # Verify fallback to learner
     assert plan == mock_plan
     assert agent.learner.generate_plan.called
+
+import pytest
+from pathlib import Path
+from unittest.mock import Mock, patch
+from ai_agent.core.agent import Agent
+from ai_agent.data.trajectory_manager import Trajectory
+
+def test_agent_initialization(git_repo, test_storage):
+    """Test agent initialization with valid repository and storage"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    trajectory_manager = Mock()
+    
+    agent = Agent(env=env, trajectory_manager=trajectory_manager)
+    assert agent.env == env
+    assert agent.trajectory_manager == trajectory_manager
+    assert agent.current_trajectory is None
+
+def test_handle_error(git_repo, test_storage):
+    """Test error handling with recovery patterns"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    env.error_patterns = {}
+    env.get_state.return_value = {'branch': 'main'}
+    env._get_recovery_actions.return_value = []  # Initially no recovery actions
+    
+    trajectory_manager = Mock()
+    trajectory_manager.retrieve_similar_trajectories.return_value = []
+    
+    agent = Agent(env=env, trajectory_manager=trajectory_manager)
+    
+    # Test with no recovery pattern
+    assert not agent.handle_error("test_error", {})
+    
+    # Test with recovery pattern
+    recovery_actions = [{'type': 'fix_permissions', 'path': 'test.py'}]
+    env._get_recovery_actions.return_value = recovery_actions
+    env.execute.return_value = {'status': 'success'}
+    
+    assert agent.handle_error("permission_denied", {})
+    env.add_recovery_pattern.assert_called_once()
+
+def test_execute_action(git_repo, test_storage):
+    """Test action execution with error handling"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    env.execute.return_value = {'status': 'success'}
+    env._get_recovery_actions.return_value = []
+    env.get_state.return_value = {'branch': 'main'}
+    
+    agent = Agent(env=env, trajectory_manager=Mock())
+    
+    # Test successful action
+    action = {'type': 'edit_file', 'path': 'test.py'}
+    result = agent.execute_action(action)
+    assert result['status'] == 'success'
+    
+    # Test action with error
+    env.execute.return_value = {'status': 'error', 'error': 'test_error'}
+    result = agent.execute_action(action)
+    assert result['status'] == 'error'
+    assert 'error' in result
+
+def test_analyze_trajectory(git_repo, test_storage):
+    """Test trajectory analysis"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    
+    agent = Agent(env=env, trajectory_manager=Mock())
+    
+    # Test empty trajectory
+    empty_trajectory = type('Trajectory', (), {
+        'actions': [],
+        'observations': []
+    })()
+    analysis = agent.analyze_trajectory(empty_trajectory)
+    assert analysis['success_rate'] == 0.0
+    assert analysis['completion_rate'] == 0.0
+    
+    # Test successful trajectory
+    successful_trajectory = type('Trajectory', (), {
+        'actions': [
+            {'type': 'create_file', 'path': 'test.py'},
+            {'type': 'edit_file', 'path': 'test.py'}
+        ],
+        'observations': [
+            {'status': 'success'},
+            {'status': 'success'}
+        ],
+        'instruction': 'Create and edit test.py'
+    })()
+    analysis = agent.analyze_trajectory(successful_trajectory)
+    assert analysis['success_rate'] == 1.0
+    assert analysis['error_rate'] == 0.0
+    assert len(analysis['patterns']) > 0
+
+def test_pattern_quality(git_repo, test_storage):
+    """Test pattern quality assessment"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    
+    agent = Agent(env=env, trajectory_manager=Mock())
+    
+    # Test invalid pattern
+    assert agent.assess_pattern_quality({}) == 0.0
+    
+    # Test valid pattern
+    pattern = {
+        'sequence': ('create_file', 'edit_file', 'git_commit'),
+        'frequency': 5
+    }
+    quality = agent.assess_pattern_quality(pattern)
+    assert 0 <= quality <= 1.0
+
+def test_goal_alignment(git_repo, test_storage):
+    """Test goal alignment calculation"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    
+    agent = Agent(env=env, trajectory_manager=Mock())
+    
+    # Test perfect alignment
+    trajectory = type('Trajectory', (), {
+        'instruction': 'Create test.py and add test function',
+        'actions': [
+            {'type': 'create_file', 'path': 'test.py'},
+            {'type': 'edit_file', 'path': 'test.py'}
+        ],
+        'observations': [
+            {'status': 'success'},
+            {'status': 'success'}
+        ]
+    })()
+    alignment = agent._check_goal_alignment(trajectory)
+    assert alignment > 0.7  # High alignment score
+
+    # Test misaligned actions
+    trajectory.actions = [
+        {'type': 'git_checkout', 'branch': 'main'},
+        {'type': 'git_commit', 'message': 'test'}
+    ]
+    alignment = agent._check_goal_alignment(trajectory)
+    assert alignment < 0.5  # Low alignment score
+
+def test_quality_report(git_repo, test_storage):
+    """Test quality report generation"""
+    env = Mock()
+    env.repo_path = git_repo.working_dir
+    env.error_patterns = {
+        'error1': Mock(success_rate=0.8),
+        'error2': Mock(success_rate=0.4)
+    }
+    
+    trajectory_manager = Mock()
+    trajectory_manager.get_action_patterns.return_value = [
+        {
+            'sequence': ('create_file', 'edit_file'),
+            'frequency': 5
+        }
+    ]
+    trajectory_manager.load_trajectories.return_value = [
+        type('Trajectory', (), {
+            'actions': [
+                {'type': 'create_file', 'path': 'test.py'}
+            ],
+            'observations': [{'status': 'success'}],
+            'final_state': {'branch': 'main'}
+        })()
+    ]
+    
+    agent = Agent(env=env, trajectory_manager=trajectory_manager)
+    report = agent.get_quality_report()
+    
+    assert 'patterns' in report
+    assert 'error_handling' in report
+    assert 'coverage' in report
+    assert report['patterns']['total'] > 0
+    assert isinstance(report['coverage']['action_types'], list)
